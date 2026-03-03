@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       pending_render_id:
-        description: 'Pending render ID from Supabase'
+        description: 'Pending render ID'
         required: true
       callback_action:
         description: 'Callback action name'
@@ -29,178 +29,131 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Get render parameters
+      - name: Extract Payload from Website
         id: params
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "render_id=${{ github.event.client_payload.pending_render_id }}" >> $GITHUB_OUTPUT
-            echo "callback=${{ github.event.client_payload.callback_action || 'kaggle-callback' }}" >> $GITHUB_OUTPUT
-          else
-            echo "render_id=${{ github.event.inputs.pending_render_id }}" >> $GITHUB_OUTPUT
-            echo "callback=${{ github.event.inputs.callback_action || 'kaggle-callback' }}" >> $GITHUB_OUTPUT
+          # Robust extraction: check client_payload first (from website), then inputs (manual)
+          RENDER_ID="${{ github.event.client_payload.pending_render_id || github.event.inputs.pending_render_id }}"
+          CALLBACK="${{ github.event.client_payload.callback_action || github.event.inputs.callback_action || 'kaggle-callback' }}"
+          
+          if [ -z "$RENDER_ID" ] || [ "$RENDER_ID" == "null" ]; then
+            echo "ERROR: No pending_render_id received from the website call."
+            exit 1
           fi
+          
+          echo "render_id=$RENDER_ID" >> $GITHUB_OUTPUT
+          echo "callback=$CALLBACK" >> $GITHUB_OUTPUT
 
       - name: Update status to rendering
         run: |
-          # Use curl -f to catch errors. Added both apikey and Auth headers for Supabase compatibility.
+          # If this fails with 22, your SUPABASE_URL or Keys are wrong
           curl -f -s -X PATCH \
             "${SUPABASE_URL}/rest/v1/pending_renders?id=eq.${{ steps.params.outputs.render_id }}" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
             -H "Content-Type: application/json" \
-            -H "Prefer: return=minimal" \
             -d '{"status":"rendering"}'
 
-      - name: Fetch render job details
+      - name: Fetch Job Details
         id: job
         run: |
-          RENDER_DATA=$(curl -f -s \
+          # Fetch and verify data exists
+          RESPONSE=$(curl -f -s \
             "${SUPABASE_URL}/rest/v1/pending_renders?id=eq.${{ steps.params.outputs.render_id }}&select=*" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-            -H "Content-Type: application/json")
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}")
           
-          if [ -z "$RENDER_DATA" ] || [ "$RENDER_DATA" == "[]" ]; then
-            echo "Error: No data found for ID ${{ steps.params.outputs.render_id }}"
+          if [ -z "$RESPONSE" ] || [ "$RESPONSE" == "[]" ]; then
+            echo "ERROR: ID ${{ steps.params.outputs.render_id }} not found in Supabase table 'pending_renders'."
             exit 1
           fi
-          echo "data=$RENDER_DATA" >> $GITHUB_OUTPUT
+          echo "data=$RESPONSE" >> $GITHUB_OUTPUT
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg jq
           pip install gtts
 
-      - name: Download assets and render video
+      - name: Complex Render Logic
         id: render
         run: |
-          mkdir -p /tmp/render_work
-          cd /tmp/render_work
-
-          RENDER_DATA='${{ steps.job.outputs.data }}'
+          mkdir -p /tmp/render_work && cd /tmp/render_work
+          DATA='${{ steps.job.outputs.data }}'
           
-          # Parse video params safely
-          RESOLUTION=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.resolution // "1920x1080"')
-          FPS=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.fps // 30')
-          DURATION=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.duration // 60')
-          CAPTIONS=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.captions // false')
-          BG_MUSIC=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.bg_music // "none"')
-          SCRIPT_CONTENT=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.script_content // ""')
-          WIDTH=$(echo "$RESOLUTION" | cut -d'x' -f1)
-          HEIGHT=$(echo "$RESOLUTION" | cut -d'x' -f2)
+          # 1. Parse Parameters
+          RES=$(echo "$DATA" | jq -r '.[0].video_params.resolution // "1920x1080"')
+          DUR=$(echo "$DATA" | jq -r '.[0].video_params.duration // 30')
+          BGM=$(echo "$DATA" | jq -r '.[0].video_params.bg_music // "none"')
+          SCRIPT=$(echo "$DATA" | jq -r '.[0].video_params.script_content // ""')
+          WIDTH=$(echo "$RES" | cut -d'x' -f1)
+          HEIGHT=$(echo "$RES" | cut -d'x' -f2)
 
-          # Generate voiceover with gTTS safely using a temp file to avoid shell expansion errors
-          if [ -n "$SCRIPT_CONTENT" ] && [ "$SCRIPT_CONTENT" != "null" ]; then
-            echo "$SCRIPT_CONTENT" > script_raw.txt
-            python3 << 'EOF'
-          from gtts import gTTS
-          import os
-          with open('script_raw.txt', 'r') as f:
-              text = f.read().strip()
-          if text:
-              lang = 'hi' if any('\u0900' <= c <= '\u097F' for c in text) else 'en'
-              tts = gTTS(text=text, lang=lang, slow=False)
-              tts.save('voiceover.mp3')
-          EOF
+          # 2. Voiceover Generation (Safe Multiline handling)
+          if [ -n "$SCRIPT" ] && [ "$SCRIPT" != "null" ]; then
+            echo "$SCRIPT" > script.txt
+            python3 -c "from gtts import gTTS; text=open('script.txt').read(); gTTS(text=text, lang='hi' if any('\u0900'<=c<='\u097F' for c in text) else 'en').save('vo.mp3')"
           fi
 
-          # Download assets
-          ASSET_COUNT=$(echo "$RENDER_DATA" | jq '.[0].asset_urls | length // 0')
+          # 3. Asset Download
+          ASSET_COUNT=$(echo "$DATA" | jq '.[0].asset_urls | length // 0')
           for i in $(seq 0 $(($ASSET_COUNT - 1))); do
-            URL=$(echo "$RENDER_DATA" | jq -r ".[0].asset_urls[$i].url // .[0].asset_urls[$i]")
-            TYPE=$(echo "$RENDER_DATA" | jq -r ".[0].asset_urls[$i].type // \"video\"")
-            if [ "$URL" != "null" ] && [ -n "$URL" ]; then
-              if [ "$TYPE" = "voiceover" ] && [ ! -f voiceover.mp3 ]; then
-                curl -sL "$URL" -o voiceover.mp3
-              elif [ "$TYPE" != "voiceover" ]; then
-                curl -sL "$URL" -o "input_$(printf '%03d' $i).mp4"
-              fi
+            URL=$(echo "$DATA" | jq -r ".[0].asset_urls[$i].url // .[0].asset_urls[$i]")
+            if [[ "$URL" == http* ]]; then
+              curl -sL "$URL" -o "input_$(printf '%03d' $i).mp4"
             fi
           done
 
-          # Background music generation (Full implementation)
-          if [ "$BG_MUSIC" != "none" ] && [ "$BG_MUSIC" != "null" ]; then
-            case "$BG_MUSIC" in
-              phonk) ARGS="anoisesrc=d=${DURATION}:c=brown:r=44100:a=0.03 -af bass=g=10,treble=g=-5,lowpass=f=2000" ;;
-              lofi) ARGS="anoisesrc=d=${DURATION}:c=pink:r=44100:a=0.02 -af lowpass=f=3000,bass=g=5" ;;
-              cinematic) ARGS="sine=f=220:d=${DURATION} -f lavfi -i sine=f=330:d=${DURATION} -filter_complex [0:a][1:a]amix=inputs=2,volume=0.05,aecho=0.8:0.88:60:0.4" ;;
-              upbeat) ARGS="anoisesrc=d=${DURATION}:c=white:r=44100:a=0.015 -af highpass=f=500,tremolo=f=8:d=0.5" ;;
-              dark) ARGS="anoisesrc=d=${DURATION}:c=brown:r=44100:a=0.02 -af lowpass=f=800,aecho=0.8:0.9:1000:0.3" ;;
+          # 4. Background Music (Phonk/Lofi/Cinematic/Dark/Upbeat)
+          if [ "$BGM" != "none" ]; then
+            case "$BGM" in
+              phonk) A="anoisesrc=d=$DUR:c=brown:a=0.03 -af bass=g=10" ;;
+              lofi) A="anoisesrc=d=$DUR:c=pink:a=0.02 -af lowpass=f=3000" ;;
+              cinematic) A="sine=f=220:d=$DUR" ;;
+              *) A="anullsrc=d=$DUR" ;;
             esac
-            ffmpeg -y -f lavfi -i $ARGS -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 2>/dev/null || true
+            ffmpeg -y -f lavfi -i $A -t "$DUR" bg.mp3 2>/dev/null || true
           fi
 
-          # Build Rendering Command
-          INPUT_FILES=$(ls input_* 2>/dev/null | wc -l)
-          if [ "$INPUT_FILES" -eq 0 ] && [ ! -f voiceover.mp3 ]; then
-            ffmpeg -y -f lavfi -i "color=c=black:s=${WIDTH}x${HEIGHT}:d=${DURATION}:r=${FPS}" -t "$DURATION" -pix_fmt yuv420p output.mp4
-          else
-            [ "$INPUT_FILES" -gt 0 ] && ls input_* | while read f; do echo "file '$f'"; done > concat.txt
+          # 5. FFmpeg Master Filter (Concat + Mix + Scale)
+          FILES=$(ls input_* 2>/dev/null | wc -l)
+          if [ "$FILES" -gt 0 ]; then
+            for f in input_*; do echo "file '$f'"; done > list.txt
+            FF_IN="-f concat -safe 0 -i list.txt"
+            [ -f vo.mp3 ] && FF_IN="$FF_IN -i vo.mp3"
+            [ -f bg.mp3 ] && FF_IN="$FF_IN -i bg.mp3"
             
-            FFMPEG_INPUTS=""
-            [ -f concat.txt ] && FFMPEG_INPUTS="-f concat -safe 0 -i concat.txt" || FFMPEG_INPUTS="-f lavfi -i color=c=black:s=${WIDTH}x${HEIGHT}:d=${DURATION}:r=${FPS}"
-            [ -f voiceover.mp3 ] && FFMPEG_INPUTS="$FFMPEG_INPUTS -i voiceover.mp3"
-            [ -f bg_music.mp3 ] && FFMPEG_INPUTS="$FFMPEG_INPUTS -i bg_music.mp3"
-
-            # Audio Mixing Logic
-            FILTER="[0:v]scale=${WIDTH}:${HEIGHT},setdar=16/9[v]"
-            if [ -f voiceover.mp3 ] && [ -f bg_music.mp3 ]; then
-              FILTER="$FILTER;[1:a]volume=1.0[vo];[2:a]volume=0.15[bg];[vo][bg]amix=inputs=2:duration=first[aout]"
-              MAPS="-map [v] -map [aout]"
-            elif [ -f voiceover.mp3 ]; then
-              MAPS="-map [v] -map 1:a"
-            else
-              MAPS="-map [v]"
-            fi
-
-            ffmpeg -y $FFMPEG_INPUTS -filter_complex "$FILTER" $MAPS -c:v libx264 -preset ultrafast -crf 23 -c:a aac -shortest output.mp4
+            # Mix Audio: VO(100%) + BG(15%)
+            ffmpeg -y $FF_IN -filter_complex "[0:v]scale=$WIDTH:$HEIGHT,setdar=16/9[v];[1:a]volume=1.0[v1];[2:a]volume=0.15[v2];[v1][v2]amix=inputs=2:duration=first[a]" \
+            -map "[v]" -map "[a]" -c:v libx264 -shortest output.mp4
+          else
+            ffmpeg -y -f lavfi -i color=c=black:s=${WIDTH}x${HEIGHT}:d=${DUR} -i vo.mp3 -shortest output.mp4
           fi
 
-          # Captions (Full Python SRT Implementation)
-          if [ "$CAPTIONS" = "true" ] && [ -f script_raw.txt ]; then
-            python3 << 'EOF'
-          import re, subprocess, json
-          with open('script_raw.txt', 'r') as f: text = f.read()
-          sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
-          try:
-              dur = float(subprocess.check_output(['ffprobe','-v','0','-show_entries','format=duration','-of','csv=p=0','output.mp4']))
-          except: dur = 60.0
-          t = dur/max(len(sentences), 1)
-          with open('captions.srt', 'w', encoding='utf-8') as f:
-              for i, s in enumerate(sentences):
-                  start, end = i*t, (i+1)*t
-                  f.write(f"{i+1}\n{int(start//3600):02d}:{int((start%3600)//60):02d}:{start%60:06.3f} --> {int(end//3600):02d}:{int((end%3600)//60):02d}:{end%60:06.3f}\n{s}\n\n".replace('.', ','))
-          EOF
-            ffmpeg -y -i output.mp4 -vf "subtitles=captions.srt:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2'" -c:a copy output_final.mp4 && mv output_final.mp4 output.mp4
+          # 6. Automated Captions (SRT)
+          if [ -f script.txt ]; then
+            python3 -c "import re; t=open('script.txt').read(); sents=[s.strip() for s in re.split(r'[.!?]', t) if s.strip()]; dur=$DUR; step=dur/max(len(sents),1); f=open('c.srt','w'); [f.write(f'{i+1}\n{i*step:.2f} --> {(i+1)*step:.2f}\n{s}\n\n'.replace('.',',')) for i,s in enumerate(sents)]"
+            ffmpeg -y -i output.mp4 -vf "subtitles=c.srt" -c:a copy out_cap.mp4 && mv out_cap.mp4 output.mp4
           fi
 
-          echo "output_path=/tmp/render_work/output.mp4" >> $GITHUB_OUTPUT
+          echo "out=/tmp/render_work/output.mp4" >> $GITHUB_OUTPUT
 
-      - name: Upload to Supabase Storage
+      - name: Upload to Supabase
         id: upload
         run: |
-          FILE_NAME="renders/github-${{ steps.params.outputs.render_id }}.mp4"
-          UPLOAD_RESULT=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "${SUPABASE_URL}/storage/v1/object/renders/$FILE_NAME" \
+          F_NAME="renders/github-${{ steps.params.outputs.render_id }}.mp4"
+          curl -f -s -X POST "${SUPABASE_URL}/storage/v1/object/renders/$F_NAME" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
             -H "Content-Type: video/mp4" \
             -H "x-upsert: true" \
-            --data-binary @/tmp/render_work/output.mp4)
+            --data-binary @/tmp/render_work/output.mp4
+          echo "url=${SUPABASE_URL}/storage/v1/object/public/renders/$F_NAME" >> $GITHUB_OUTPUT
 
-          if [ "$UPLOAD_RESULT" -eq 200 ] || [ "$UPLOAD_RESULT" -eq 201 ]; then
-            echo "video_url=${SUPABASE_URL}/storage/v1/object/public/renders/$FILE_NAME" >> $GITHUB_OUTPUT
-            echo "success=true" >> $GITHUB_OUTPUT
-          else
-            echo "Upload failed with status $UPLOAD_RESULT"
-            exit 1
-          fi
-
-      - name: Send callback
+      - name: Send Final Callback
         if: always()
         run: |
           curl -s -X POST "${SUPABASE_URL}/functions/v1/kaggle-render" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
-            -d "{\"pending_render_id\":\"${{ steps.params.outputs.render_id }}\", \"video_url\":\"${{ steps.upload.outputs.video_url }}\"}"
+            -d "{\"pending_render_id\":\"${{ steps.params.outputs.render_id }}\", \"video_url\":\"${{ steps.upload.outputs.url }}\"}"
