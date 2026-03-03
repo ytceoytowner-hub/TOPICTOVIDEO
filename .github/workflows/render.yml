@@ -111,13 +111,13 @@ jobs:
               LANG_CODE="en"
             fi
             python3 -c "
-from gtts import gTTS
-import sys
-text = '''$SCRIPT_CONTENT'''
-tts = gTTS(text=text, lang='$LANG_CODE', slow=False)
-tts.save('voiceover_gtts.mp3')
-print('gTTS voiceover generated successfully')
-"
+          from gtts import gTTS
+          import sys
+          text = '''$SCRIPT_CONTENT'''
+          tts = gTTS(text=text, lang='$LANG_CODE', slow=False)
+          tts.save('voiceover_gtts.mp3')
+          print('gTTS voiceover generated successfully')
+          "
             # If gTTS generated successfully, use it
             if [ -f voiceover_gtts.mp3 ]; then
               echo "Using gTTS voiceover"
@@ -230,37 +230,37 @@ print('gTTS voiceover generated successfully')
             
             # Create SRT from script content
             python3 << 'CAPTION_SCRIPT'
-import subprocess, json, math
+          import subprocess, json, math
 
-script_text = """SCRIPT_CONTENT_PLACEHOLDER"""
-# Split into sentences
-import re
-sentences = re.split(r'(?<=[.!?])\s+', script_text.strip())
-sentences = [s for s in sentences if s.strip()]
+          script_text = """SCRIPT_CONTENT_PLACEHOLDER"""
+          # Split into sentences
+          import re
+          sentences = re.split(r'(?<=[.!?])\s+', script_text.strip())
+          sentences = [s for s in sentences if s.strip()]
 
-# Get audio duration
-try:
-    result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json', 'voiceover.mp3'], capture_output=True, text=True)
-    duration = float(json.loads(result.stdout)['format']['duration'])
-except:
-    duration = 60.0
+          # Get audio duration
+          try:
+              result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json', 'voiceover.mp3'], capture_output=True, text=True)
+              duration = float(json.loads(result.stdout)['format']['duration'])
+          except:
+              duration = 60.0
 
-time_per_sentence = duration / max(len(sentences), 1)
-srt_lines = []
-for i, sent in enumerate(sentences):
-    start = i * time_per_sentence
-    end = min((i + 1) * time_per_sentence, duration)
-    sh, sm, ss = int(start//3600), int((start%3600)//60), start%60
-    eh, em, es = int(end//3600), int((end%3600)//60), end%60
-    srt_lines.append(f"{i+1}")
-    srt_lines.append(f"{sh:02d}:{sm:02d}:{ss:06.3f} --> {eh:02d}:{em:02d}:{es:06.3f}".replace('.', ','))
-    srt_lines.append(sent.strip())
-    srt_lines.append("")
+          time_per_sentence = duration / max(len(sentences), 1)
+          srt_lines = []
+          for i, sent in enumerate(sentences):
+              start = i * time_per_sentence
+              end = min((i + 1) * time_per_sentence, duration)
+              sh, sm, ss = int(start//3600), int((start%3600)//60), start%60
+              eh, em, es = int(end//3600), int((end%3600)//60), end%60
+              srt_lines.append(f"{i+1}")
+              srt_lines.append(f"{sh:02d}:{sm:02d}:{ss:06.3f} --> {eh:02d}:{em:02d}:{es:06.3f}".replace('.', ','))
+              srt_lines.append(sent.strip())
+              srt_lines.append("")
 
-with open('captions.srt', 'w', encoding='utf-8') as f:
-    f.write('\n'.join(srt_lines))
-print(f"Generated {len(sentences)} caption entries")
-CAPTION_SCRIPT
+          with open('captions.srt', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(srt_lines))
+          print(f"Generated {len(sentences)} caption entries")
+          CAPTION_SCRIPT
 
             # Replace placeholder with actual script content
             ESCAPED_SCRIPT=$(echo "$SCRIPT_CONTENT" | head -c 50000 | sed 's/"""/\\"\\"\\"/g')
@@ -269,35 +269,35 @@ CAPTION_SCRIPT
             # Simpler approach: write script to file and use Python
             echo "$SCRIPT_CONTENT" > /tmp/script_text.txt
             python3 << 'CAPTION_PY'
-import re, json, subprocess
+          import re, json, subprocess
 
-with open('/tmp/script_text.txt', 'r') as f:
-    script_text = f.read()
+          with open('/tmp/script_text.txt', 'r') as f:
+              script_text = f.read()
 
-sentences = re.split(r'(?<=[.!?])\s+', script_text.strip())
-sentences = [s for s in sentences if s.strip()]
+          sentences = re.split(r'(?<=[.!?])\s+', script_text.strip())
+          sentences = [s for s in sentences if s.strip()]
 
-try:
-    result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json', 'voiceover.mp3'], capture_output=True, text=True)
-    duration = float(json.loads(result.stdout)['format']['duration'])
-except:
-    duration = 60.0
+          try:
+              result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json', 'voiceover.mp3'], capture_output=True, text=True)
+              duration = float(json.loads(result.stdout)['format']['duration'])
+          except:
+              duration = 60.0
 
-time_per = duration / max(len(sentences), 1)
-srt = []
-for i, sent in enumerate(sentences):
-    start = i * time_per
-    end = min((i + 1) * time_per, duration)
-    def fmt(t):
-        h, rem = divmod(t, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h):02d}:{int(m):02d}:{s:06.3f}".replace('.', ',')
-    srt.append(f"{i+1}\n{fmt(start)} --> {fmt(end)}\n{sent.strip()}\n")
+          time_per = duration / max(len(sentences), 1)
+          srt = []
+          for i, sent in enumerate(sentences):
+              start = i * time_per
+              end = min((i + 1) * time_per, duration)
+              def fmt(t):
+                  h, rem = divmod(t, 3600)
+                  m, s = divmod(rem, 60)
+                  return f"{int(h):02d}:{int(m):02d}:{s:06.3f}".replace('.', ',')
+              srt.append(f"{i+1}\n{fmt(start)} --> {fmt(end)}\n{sent.strip()}\n")
 
-with open('captions.srt', 'w', encoding='utf-8') as f:
-    f.write('\n'.join(srt))
-print(f"Generated {len(sentences)} captions")
-CAPTION_PY
+          with open('captions.srt', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(srt))
+          print(f"Generated {len(sentences)} captions")
+          CAPTION_PY
 
             if [ -f captions.srt ]; then
               echo "Burning captions into video..."
