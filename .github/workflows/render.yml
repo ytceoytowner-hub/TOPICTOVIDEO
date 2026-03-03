@@ -11,6 +11,11 @@
 
 name: Render Video
 
+permissions:
+  contents: write
+  actions: write
+  statuses: write
+
 on:
   repository_dispatch:
     types: [render-video]
