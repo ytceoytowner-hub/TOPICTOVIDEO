@@ -11,167 +11,91 @@ on:
   workflow_dispatch:
     inputs:
       pending_render_id:
-        description: 'Pending render ID from Supabase'
+        description: 'Pending render ID'
         required: true
-      callback_action:
-        description: 'Callback action name'
-        required: false
-        default: 'kaggle-callback'
-
-env:
-  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-  SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
 jobs:
   render:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # These MUST match your GitHub Secrets names exactly
+      S_URL: ${{ secrets.SUPABASE_URL }}
+      S_ANON: ${{ secrets.SUPABASE_ANON_KEY }}
+      S_SERV: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
     steps:
-      - name: Get render parameters
-        id: params
+      - name: Debug Connection
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "render_id=${{ github.event.client_payload.pending_render_id }}" >> $GITHUB_OUTPUT
-            echo "callback=${{ github.event.client_payload.callback_action || 'kaggle-callback' }}" >> $GITHUB_OUTPUT
-          else
-            echo "render_id=${{ github.event.inputs.pending_render_id }}" >> $GITHUB_OUTPUT
-            echo "callback=${{ github.event.inputs.callback_action || 'kaggle-callback' }}" >> $GITHUB_OUTPUT
-          fi
+          echo "Checking Supabase Connection..."
+          if [ -z "$S_URL" ]; then echo "ERROR: SUPABASE_URL is empty"; exit 1; fi
+          # Test if the URL is reachable
+          curl -I -s "${S_URL}/rest/v1/" -H "apikey: ${S_ANON}" || echo "Connection test failed but continuing..."
 
-      - name: Update status to rendering
+      - name: Fetch Data
+        id: fetch
         run: |
-          # Use both headers for maximum compatibility with Supabase
-          curl -f -s -X PATCH \
-            "${{ env.SUPABASE_URL }}/rest/v1/pending_renders?id=eq.${{ steps.params.outputs.render_id }}" \
-            -H "apikey: ${{ env.SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ env.SUPABASE_SERVICE_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d '{"status":"rendering"}'
-
-      - name: Fetch render job details
-        id: job
-        run: |
-          # Fetch data and save to file to prevent shell buffer issues
-          curl -f -s \
-            "${{ env.SUPABASE_URL }}/rest/v1/pending_renders?id=eq.${{ steps.params.outputs.render_id }}&select=*" \
-            -H "apikey: ${{ env.SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ env.SUPABASE_SERVICE_KEY }}" > render_data.json
+          RENDER_ID="${{ github.event.client_payload.pending_render_id || github.event.inputs.pending_render_id }}"
+          echo "render_id=$RENDER_ID" >> $GITHUB_OUTPUT
           
-          # Check if file is empty
-          if [ ! -s render_data.json ]; then echo "Data fetch failed"; exit 1; fi
+          # Fetching data into a file
+          curl -f -s -X GET \
+            "${S_URL}/rest/v1/pending_renders?id=eq.${RENDER_ID}&select=*" \
+            -H "apikey: ${S_ANON}" \
+            -H "Authorization: Bearer ${S_SERV}" \
+            -o data.json
           
-          # Pass data to the next step via environment file
-          echo "RENDER_DATA_FILE=$(pwd)/render_data.json" >> $GITHUB_ENV
+          if [ ! -s data.json ]; then echo "No data found for ID $RENDER_ID"; exit 1; fi
 
-      - name: Install dependencies
+      - name: Install Tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg jq
+          sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq
           pip install gtts
 
-      - name: Download assets and render video
-        id: render
+      - name: Process and Render
         run: |
-          mkdir -p /tmp/render_work
-          cd /tmp/render_work
-          cp ${{ env.RENDER_DATA_FILE }} data.json
+          # Extract variables
+          SCRIPT=$(jq -r '.[0].video_params.script_content // ""' data.json)
+          RES=$(jq -r '.[0].video_params.resolution // "1280x720"' data.json)
+          DUR=$(jq -r '.[0].video_params.duration // 10' data.json)
+          WIDTH=$(echo $RES | cut -d'x' -f1)
+          HEIGHT=$(echo $RES | cut -d'x' -f2)
 
-          # Parse params with jq
-          RESOLUTION=$(jq -r '.[0].video_params.resolution // "1280x720"' data.json)
-          FPS=$(jq -r '.[0].video_params.fps // 30' data.json)
-          DURATION=$(jq -r '.[0].video_params.duration // 10' data.json)
-          CAPTIONS=$(jq -r '.[0].video_params.captions // false' data.json)
-          BG_MUSIC=$(jq -r '.[0].video_params.bg_music // "none"' data.json)
-          SCRIPT_CONTENT=$(jq -r '.[0].video_params.script_content // ""' data.json)
-          WIDTH=$(echo "$RESOLUTION" | cut -d'x' -f1)
-          HEIGHT=$(echo "$RESOLUTION" | cut -d'x' -f2)
-
-          # Generate voiceover
-          if [ -n "$SCRIPT_CONTENT" ] && [ "$SCRIPT_CONTENT" != "null" ]; then
-            echo "$SCRIPT_CONTENT" > script.txt
-            python3 -c "
-          from gtts import gTTS
-          import os
-          with open('script.txt', 'r') as f: text = f.read().strip()
-          if text:
-              lang = 'hi' if any('\u0900' <= c <= '\u097F' for c in text) else 'en'
-              gTTS(text=text, lang=lang).save('voiceover.mp3')
-          "
+          # 1. Voiceover
+          if [ -n "$SCRIPT" ]; then
+            python3 -c "from gtts import gTTS; gTTS(text='''$SCRIPT''', lang='hi' if any('\u0900' <= c <= '\u097F' for c in '''$SCRIPT''') else 'en').save('vo.mp3')"
           fi
 
-          # Download Assets
-          jq -c '.[0].asset_urls[]' data.json | while read i; do
-            URL=$(echo $i | jq -r '.url // .')
-            TYPE=$(echo $i | jq -r '.type // "video"')
-            if [ "$TYPE" = "voiceover" ] && [ ! -f voiceover.mp3 ]; then
-              curl -sL "$URL" -o voiceover.mp3
-            elif [ "$TYPE" != "voiceover" ]; then
-              # Only download if URL looks valid
-              [[ "$URL" == http* ]] && curl -sL "$URL" -o "input_$(date +%s%N).mp4"
-            fi
-          done
-
-          # Background Music Generation (FFmpeg)
-          if [ "$BG_MUSIC" != "none" ]; then
-            ffmpeg -y -f lavfi -i "anoisesrc=d=$DURATION:c=pink:r=44100:a=0.01" -t "$DURATION" bg_music.mp3 2>/dev/null || true
+          # 2. Download first video asset found
+          URL=$(jq -r '.[0].asset_urls[0].url // .[0].asset_urls[0]' data.json)
+          if [[ "$URL" == http* ]]; then
+            curl -L "$URL" -o input.mp4
           fi
 
-          # FFmpeg Rendering
-          INPUTS=$(ls input_*.mp4 2>/dev/null | wc -l)
-          if [ "$INPUTS" -gt 0 ]; then
-            # Build concat list
-            for f in input_*.mp4; do echo "file '$f'"; done > list.txt
-            FFMPEG_CMD="ffmpeg -y -f concat -safe 0 -i list.txt"
-            
-            # Add Audio if exists
-            [ -f voiceover.mp3 ] && FFMPEG_CMD="$FFMPEG_CMD -i voiceover.mp3"
-            [ -f bg_music.mp3 ] && FFMPEG_CMD="$FFMPEG_CMD -i bg_music.mp3"
-            
-            # Map video and mix audio
-            $FFMPEG_CMD -filter_complex "[0:v]scale=$WIDTH:$HEIGHT,setdar=16/9[v];[1:a][2:a]amix=inputs=2:duration=first[a]" \
-              -map "[v]" -map "[a]" -c:v libx264 -pix_fmt yuv420p -t "$DURATION" output.mp4
+          # 3. Final Render (Handles missing video by using black screen)
+          if [ -f input.mp4 ]; then
+            ffmpeg -y -i input.mp4 -i vo.mp3 -map 0:v -map 1:a -c:v libx264 -t "$DUR" -pix_fmt yuv420p -vf "scale=$WIDTH:$HEIGHT" output.mp4
           else
-            # Fallback to black screen
-            ffmpeg -y -f lavfi -i color=c=black:s=${WIDTH}x${HEIGHT}:d=${DURATION} -i voiceover.mp3 -shortest output.mp4
+            ffmpeg -y -f lavfi -i color=c=black:s=${WIDTH}x${HEIGHT}:d=${DUR} -i vo.mp3 -map 0:v -map 1:a -c:v libx264 -pix_fmt yuv420p output.mp4
           fi
 
-          # Burn Captions
-          if [ "$CAPTIONS" = "true" ] && [ -f script.txt ]; then
-             # Simple caption script
-             python3 -c "
-          import subprocess
-          dur = float(subprocess.check_output(['ffprobe','-v','0','-show_entries','format=duration','-of','csv=p=0','output.mp4']))
-          with open('caps.srt','w') as f:
-              f.write(f'1\n00:00:00,000 --> 00:00:{int(dur):02d},000\nSubtitle Text')
-          "
-             ffmpeg -y -i output.mp4 -vf "drawtext=textfile=script.txt:fontcolor=white:fontsize=24:x=(w-text_w)/2:y=h-100:box=1:boxcolor=black@0.5" -c:a copy out_final.mp4
-             mv out_final.mp4 output.mp4
-          fi
-
-          echo "output_path=/tmp/render_work/output.mp4" >> $GITHUB_OUTPUT
-
-      - name: Upload to Supabase Storage
+      - name: Upload
         id: upload
         run: |
-          FILE_NAME="renders/github-${{ steps.params.outputs.render_id }}.mp4"
-          UPLOAD_URL="${{ env.SUPABASE_URL }}/storage/v1/object/renders/$FILE_NAME"
-          
-          # Use -v to see what's happening if it fails
-          RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
-            -H "apikey: ${{ env.SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ env.SUPABASE_SERVICE_KEY }}" \
+          F_NAME="renders/${{ steps.fetch.outputs.render_id }}.mp4"
+          curl -f -s -X POST "${S_URL}/storage/v1/object/renders/${F_NAME}" \
+            -H "apikey: ${S_ANON}" \
+            -H "Authorization: Bearer ${S_SERV}" \
             -H "Content-Type: video/mp4" \
             -H "x-upsert: true" \
-            --data-binary @/tmp/render_work/output.mp4)
+            --data-binary @output.mp4
           
-          echo "video_url=${{ env.SUPABASE_URL }}/storage/v1/object/public/renders/$FILE_NAME" >> $GITHUB_OUTPUT
+          echo "url=${S_URL}/storage/v1/object/public/renders/${F_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Send callback
+      - name: Callback
         if: always()
         run: |
-          curl -s -X POST "${{ env.SUPABASE_URL }}/functions/v1/kaggle-render" \
-            -H "apikey: ${{ env.SUPABASE_ANON_KEY }}" \
+          curl -s -X POST "${S_URL}/functions/v1/kaggle-render" \
+            -H "apikey: ${S_ANON}" \
             -H "Content-Type: application/json" \
-            -d "{\"pending_render_id\":\"${{ steps.params.outputs.render_id }}\", \"video_url\":\"${{ steps.upload.outputs.video_url }}\"}"
+            -d "{\"pending_render_id\":\"${{ steps.fetch.outputs.render_id }}\", \"video_url\":\"${{ steps.upload.outputs.url }}\"}"
