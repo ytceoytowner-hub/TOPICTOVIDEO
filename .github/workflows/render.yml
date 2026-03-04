@@ -76,8 +76,6 @@ jobs:
             -H "$AUTH_HEADER" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json")
-          
-          # Save to file to avoid shell escaping issues
           echo "$RENDER_DATA" > /tmp/render_data.json
           echo "data_file=/tmp/render_data.json" >> $GITHUB_OUTPUT
 
@@ -85,17 +83,106 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg jq
-          pip install gtts
+          pip install edge-tts
+
+      - name: Prepare scripts
+        run: |
+          mkdir -p /tmp/render_work /tmp/scripts
+
+          # Write TTS script
+          cat > /tmp/scripts/generate_tts.py << 'PYEOF'
+          import asyncio
+          import edge_tts
+          import re
+          import sys
+          import json
+
+          async def main():
+              with open('/tmp/script_text.txt', 'r', encoding='utf-8') as f:
+                  text = f.read().strip()
+              if not text or len(text) < 5:
+                  print("No script text, skipping TTS")
+                  sys.exit(0)
+
+              has_devanagari = bool(re.search(r'[\u0900-\u097F]', text))
+
+              if has_devanagari:
+                  voice = "hi-IN-SwaraNeural"
+              else:
+                  voice = "en-US-AndrewMultilingualNeural"
+
+              print(f"Generating voiceover with {voice} ({len(text)} chars)")
+
+              # Add SSML prosody for natural expression
+              ssml_text = f'''<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis"
+                xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
+                <voice name="{voice}">
+                  <mstts:express-as style="narration-professional">
+                    <prosody rate="+5%" pitch="+2%">
+                      {text[:5000]}
+                    </prosody>
+                  </mstts:express-as>
+                </voice>
+              </speak>'''
+
+              communicate = edge_tts.Communicate(text[:5000], voice)
+              await communicate.save("/tmp/render_work/voiceover.mp3")
+              print("Edge-TTS voiceover saved successfully")
+
+          asyncio.run(main())
+          PYEOF
+
+          # Write caption script
+          cat > /tmp/scripts/generate_captions.py << 'PYEOF'
+          import re
+          import json
+          import subprocess
+
+          with open('/tmp/script_text.txt', 'r', encoding='utf-8') as f:
+              script_text = f.read().strip()
+
+          if not script_text:
+              exit(0)
+
+          sentences = re.split(r'(?<=[.!?\u0964])\s+', script_text)
+          sentences = [s.strip() for s in sentences if s.strip()]
+
+          try:
+              result = subprocess.run(
+                  ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json',
+                   '/tmp/render_work/voiceover.mp3'],
+                  capture_output=True, text=True
+              )
+              duration = float(json.loads(result.stdout)['format']['duration'])
+          except Exception:
+              duration = 60.0
+
+          time_per = duration / max(len(sentences), 1)
+          srt_lines = []
+          for i, sent in enumerate(sentences):
+              start = i * time_per
+              end = min((i + 1) * time_per, duration)
+              def fmt(t):
+                  h, rem = divmod(t, 3600)
+                  m, s = divmod(rem, 60)
+                  return f"{int(h):02d}:{int(m):02d}:{s:06.3f}".replace('.', ',')
+              srt_lines.append(f"{i+1}\n{fmt(start)} --> {fmt(end)}\n{sent}\n")
+
+          with open('/tmp/render_work/captions.srt', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(srt_lines))
+          print(f"Generated {len(sentences)} captions")
+          PYEOF
+
+          # Fix indentation (heredoc adds spaces)
+          sed -i 's/^          //' /tmp/scripts/generate_tts.py
+          sed -i 's/^          //' /tmp/scripts/generate_captions.py
 
       - name: Download assets and render video
         id: render
         run: |
-          mkdir -p /tmp/render_work
           cd /tmp/render_work
-
           RENDER_DATA=$(cat /tmp/render_data.json)
-          
-          # Parse video params
+
           RESOLUTION=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.resolution // "1920x1080"')
           FPS=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.fps // 30')
           DURATION=$(echo "$RENDER_DATA" | jq -r '.[0].video_params.duration // 60')
@@ -104,33 +191,13 @@ jobs:
           WIDTH=$(echo "$RESOLUTION" | cut -d'x' -f1)
           HEIGHT=$(echo "$RESOLUTION" | cut -d'x' -f2)
 
-          # Extract script content to file (avoids shell escaping)
           echo "$RENDER_DATA" | jq -r '.[0].video_params.script_content // ""' > /tmp/script_text.txt
           SCRIPT_LEN=$(wc -c < /tmp/script_text.txt)
           echo "Script content length: $SCRIPT_LEN bytes"
 
-          # Generate voiceover with gTTS
+          # Generate voiceover with Edge-TTS (natural expressive voice)
           if [ "$SCRIPT_LEN" -gt 5 ]; then
-            python3 << 'GTTS_PY'
-from gtts import gTTS
-import re
-
-with open('/tmp/script_text.txt', 'r', encoding='utf-8') as f:
-    text = f.read().strip()
-
-if not text:
-    print("No script text, skipping TTS")
-    exit(0)
-
-# Detect Hindi (Devanagari characters)
-has_devanagari = bool(re.search(r'[\u0900-\u097F]', text))
-lang = 'hi' if has_devanagari else 'en'
-print(f"Generating voiceover in {'Hindi' if lang == 'hi' else 'English'} ({len(text)} chars)")
-
-tts = gTTS(text=text[:5000], lang=lang, slow=False)
-tts.save('/tmp/render_work/voiceover.mp3')
-print("gTTS voiceover saved successfully")
-GTTS_PY
+            python3 /tmp/scripts/generate_tts.py || echo "TTS generation failed, continuing without voiceover"
           fi
 
           # Download assets
@@ -181,7 +248,6 @@ GTTS_PY
           INPUT_FILES=$(ls input_* 2>/dev/null | wc -l)
           HAS_VOICEOVER=$([ -f voiceover.mp3 ] && echo "yes" || echo "no")
           HAS_BG_MUSIC=$([ -f bg_music.mp3 ] && echo "yes" || echo "no")
-
           echo "Inputs: $INPUT_FILES files, voiceover=$HAS_VOICEOVER, bg_music=$HAS_BG_MUSIC"
 
           if [ "$INPUT_FILES" -eq 0 ] && [ "$HAS_VOICEOVER" = "no" ]; then
@@ -190,7 +256,6 @@ GTTS_PY
               -t "$DURATION" -c:v libx264 -preset ultrafast -crf 23 \
               -c:a aac -b:a 192k -movflags +faststart output.mp4
           else
-            # Build input list
             INPUTS=""
             VIDX=-1
             if [ "$INPUT_FILES" -gt 0 ]; then
@@ -213,7 +278,6 @@ GTTS_PY
               else BG_IDX=0; fi
             fi
 
-            # Build filter for audio mixing
             AUDIO_FILTER=""
             AUDIO_MAP=""
             if [ "$VO_IDX" -ge 0 ] && [ "$BG_IDX" -ge 0 ]; then
@@ -234,43 +298,10 @@ GTTS_PY
               -movflags +faststart -t "$DURATION" output.mp4
           fi
 
-          # Generate and burn captions if enabled
+          # Burn captions if enabled
           if [ "$CAPTIONS" = "true" ] && [ "$SCRIPT_LEN" -gt 5 ]; then
             echo "Generating captions..."
-            python3 << 'CAPTION_PY'
-import re, json, subprocess
-
-with open('/tmp/script_text.txt', 'r', encoding='utf-8') as f:
-    script_text = f.read().strip()
-
-if not script_text:
-    exit(0)
-
-sentences = re.split(r'(?<=[.!?।])\s+', script_text)
-sentences = [s.strip() for s in sentences if s.strip()]
-
-try:
-    result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'json', '/tmp/render_work/voiceover.mp3'], capture_output=True, text=True)
-    duration = float(json.loads(result.stdout)['format']['duration'])
-except:
-    duration = 60.0
-
-time_per = duration / max(len(sentences), 1)
-srt = []
-for i, sent in enumerate(sentences):
-    start = i * time_per
-    end = min((i + 1) * time_per, duration)
-    def fmt(t):
-        h, rem = divmod(t, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h):02d}:{int(m):02d}:{s:06.3f}".replace('.', ',')
-    srt.append(f"{i+1}\n{fmt(start)} --> {fmt(end)}\n{sent}\n")
-
-with open('/tmp/render_work/captions.srt', 'w', encoding='utf-8') as f:
-    f.write('\n'.join(srt))
-print(f"Generated {len(sentences)} captions")
-CAPTION_PY
-
+            python3 /tmp/scripts/generate_captions.py || echo "Caption generation failed"
             if [ -f captions.srt ]; then
               ffmpeg -y -i output.mp4 \
                 -vf "subtitles=captions.srt:force_style='FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1,MarginV=30'" \
