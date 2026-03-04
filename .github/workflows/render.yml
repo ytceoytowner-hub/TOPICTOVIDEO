@@ -31,10 +31,16 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "render_id=${{ github.event.client_payload.pending_render_id }}" >> "$GITHUB_OUTPUT"
-            echo "callback=${{ github.event.client_payload.callback_action || 'kaggle-callback' }}" >> "$GITHUB_OUTPUT"
+            echo "callback=${{ github.event.client_payload.callback_action }}" >> "$GITHUB_OUTPUT"
           else
             echo "render_id=${{ github.event.inputs.pending_render_id }}" >> "$GITHUB_OUTPUT"
-            echo "callback=${{ github.event.inputs.callback_action || 'kaggle-callback' }}" >> "$GITHUB_OUTPUT"
+            echo "callback=${{ github.event.inputs.callback_action }}" >> "$GITHUB_OUTPUT"
+          fi
+          
+          # Set defaults if empty
+          CALLBACK=$(cat "$GITHUB_OUTPUT" | grep "^callback=" | cut -d'=' -f2-)
+          if [ -z "$CALLBACK" ]; then
+            echo "callback=kaggle-callback" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Validate required secrets
@@ -59,19 +65,21 @@ jobs:
         run: |
           set -euo pipefail
           SERVICE_KEY="${SUPABASE_SERVICE_KEY}"
+          AUTH_HEADER=""
+          
           if [[ "$SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_HEADER=( -H "apikey: $SERVICE_KEY" )
+            AUTH_HEADER="-H apikey:${SERVICE_KEY}"
           else
-            AUTH_HEADER=( -H "Authorization: Bearer $SERVICE_KEY" )
+            AUTH_HEADER="-H Authorization:Bearer ${SERVICE_KEY}"
           fi
 
           curl -sS -X PATCH \
             "${SUPABASE_URL}/rest/v1/pending_renders?id=eq.${{ steps.params.outputs.render_id }}" \
-            "${AUTH_HEADER[@]}" \
+            ${AUTH_HEADER} \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
-            -d '{"status":"rendering"}'
+            -d '{"status":"rendering"}' || echo "Warning: Failed to update render status"
 
       - name: Fetch render data
         id: fetch
@@ -79,20 +87,22 @@ jobs:
         run: |
           set -euo pipefail
           SERVICE_KEY="${SUPABASE_SERVICE_KEY}"
+          AUTH_HEADER=""
+          
           if [[ "$SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_HEADER=( -H "apikey: $SERVICE_KEY" )
+            AUTH_HEADER="-H apikey:${SERVICE_KEY}"
           else
-            AUTH_HEADER=( -H "Authorization: Bearer $SERVICE_KEY" )
+            AUTH_HEADER="-H Authorization:Bearer ${SERVICE_KEY}"
           fi
 
           curl -sS \
             "${SUPABASE_URL}/rest/v1/pending_renders?id=eq.${{ steps.params.outputs.render_id }}&select=*" \
-            "${AUTH_HEADER[@]}" \
+            ${AUTH_HEADER} \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
             -o /tmp/render_data.json
 
-          COUNT=$(jq 'length' /tmp/render_data.json)
+          COUNT=$(jq 'length' /tmp/render_data.json 2>/dev/null || echo 0)
           if [ "$COUNT" -eq 0 ]; then
             echo "No pending_renders row found"
             exit 1
@@ -122,19 +132,17 @@ jobs:
 
           echo "Resolution=${WIDTH}x${HEIGHT} FPS=${FPS} Duration=${DURATION} ScriptBytes=${SCRIPT_LEN}"
 
-          # -------------------------------
-          # Voiceover generation (Edge-TTS)
-          # -------------------------------
+          # ===== Voiceover generation (Edge-TTS) =====
           cat > tts.py << 'PYEOF'
 import asyncio
 import re
 from pathlib import Path
-
 import edge_tts
 
 text = Path('script_text.txt').read_text(encoding='utf-8').strip()
 if len(text) < 5:
-    raise SystemExit(0)
+    print("Text too short, skipping TTS")
+    exit(0)
 
 has_hindi = bool(re.search(r'[\u0900-\u097F]', text))
 voice = 'hi-IN-SwaraNeural' if has_hindi else 'en-US-AndrewMultilingualNeural'
@@ -142,7 +150,7 @@ voice = 'hi-IN-SwaraNeural' if has_hindi else 'en-US-AndrewMultilingualNeural'
 # Keep API-safe length
 text = text[:5000]
 
-# Slightly expressive but stable style
+# Create simple SSML
 ssml = f'''<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
   <voice name="{voice}">
     <mstts:express-as style="narration-professional">
@@ -152,18 +160,21 @@ ssml = f'''<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmln
 </speak>'''
 
 async def run():
-    com = edge_tts.Communicate(text=ssml, voice=voice)
-    await com.save('voiceover.mp3')
+    try:
+        com = edge_tts.Communicate(ssml=ssml, voice=voice)
+        await com.save('voiceover.mp3')
+        print("TTS completed successfully")
+    except Exception as e:
+        print(f"TTS error: {e}")
+        exit(1)
 
 asyncio.run(run())
 PYEOF
 
           python3 tts.py || echo "WARN: TTS failed, continuing without voiceover"
 
-          # -------------------------------
-          # Download and normalize assets
-          # -------------------------------
-          ASSET_COUNT=$(jq -r '.[0].asset_urls | if . == null then 0 else length end' render_data.json)
+          # ===== Download and normalize assets =====
+          ASSET_COUNT=$(jq 'if .[0].asset_urls then (.[0].asset_urls | length) else 0 end' render_data.json)
           echo "Assets: ${ASSET_COUNT}"
 
           IDX=0
@@ -174,8 +185,10 @@ PYEOF
 
               if [ -n "$URL" ] && [ "$URL" != "null" ]; then
                 if [ "$TYPE" = "voiceover" ] && [ ! -f voiceover.mp3 ]; then
+                  echo "Downloading voiceover from $URL"
                   curl -fsSL --retry 2 "$URL" -o voiceover.mp3 || echo "WARN: voiceover download failed"
                 elif [ "$TYPE" != "voiceover" ]; then
+                  echo "Downloading asset $IDX from $URL"
                   curl -fsSL --retry 2 "$URL" -o "raw_${IDX}.bin" || echo "WARN: asset download failed ($IDX)"
                 fi
               fi
@@ -188,7 +201,9 @@ PYEOF
           SEG_DUR=4
           CLIP_INDEX=0
           for F in raw_*.bin; do
-            [ -e "$F" ] || continue
+            if [ ! -e "$F" ]; then
+              continue
+            fi
             OUT="clip_$(printf '%03d' "$CLIP_INDEX").mp4"
             ffmpeg -y -hide_banner -loglevel error \
               -stream_loop -1 -i "$F" \
@@ -196,7 +211,7 @@ PYEOF
               -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
               -r "$FPS" \
               -c:v libx264 -preset veryfast -crf 23 \
-              -an "$OUT" || true
+              -an "$OUT" 2>&1 || true
 
             if [ -f "$OUT" ]; then
               CLIP_INDEX=$((CLIP_INDEX + 1))
@@ -211,57 +226,61 @@ PYEOF
               -t "$DURATION" \
               -vf "fps=${FPS},format=yuv420p" \
               -c:v libx264 -preset veryfast -crf 23 \
-              -an base_video.mp4
+              -an base_video.mp4 || true
           else
             ffmpeg -y -hide_banner -loglevel error \
               -f lavfi -i "color=c=black:s=${WIDTH}x${HEIGHT}:r=${FPS}" \
               -t "$DURATION" \
               -c:v libx264 -preset veryfast -crf 23 \
-              -an base_video.mp4
+              -an base_video.mp4 || true
           fi
 
-          # -------------------------------
-          # Optional background music
-          # -------------------------------
+          if [ ! -f base_video.mp4 ]; then
+            echo "ERROR: Failed to create base video"
+            exit 1
+          fi
+
+          # ===== Optional background music =====
           if [ "$BG_MUSIC" != "none" ] && [ "$BG_MUSIC" != "null" ] && [ -n "$BG_MUSIC" ]; then
             case "$BG_MUSIC" in
               phonk)
-                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=brown:r=44100:a=0.03" -af "bass=g=10,treble=g=-5,lowpass=f=2000" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 || true ;;
+                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=brown:r=44100:a=0.03" -af "bass=g=10,treble=g=-5,lowpass=f=2000" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 2>&1 || true ;;
               lofi)
-                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=pink:r=44100:a=0.02" -af "lowpass=f=3000,bass=g=5" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 || true ;;
+                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=pink:r=44100:a=0.02" -af "lowpass=f=3000,bass=g=5" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 2>&1 || true ;;
               cinematic)
-                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=f=220:d=${DURATION}" -f lavfi -i "sine=f=330:d=${DURATION}" -filter_complex "[0:a][1:a]amix=inputs=2:duration=longest,volume=0.05,aecho=0.8:0.88:60:0.4" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 || true ;;
+                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=f=220:d=${DURATION}" -f lavfi -i "sine=f=330:d=${DURATION}" -filter_complex "[0:a][1:a]amix=inputs=2:duration=longest,volume=0.05,aecho=0.8:0.88:60:0.4" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 2>&1 || true ;;
               upbeat)
-                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=white:r=44100:a=0.015" -af "highpass=f=500,tremolo=f=8:d=0.5" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 || true ;;
+                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=white:r=44100:a=0.015" -af "highpass=f=500,tremolo=f=8:d=0.5" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 2>&1 || true ;;
               dark)
-                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=brown:r=44100:a=0.02" -af "lowpass=f=800,aecho=0.8:0.9:1000:0.3" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 || true ;;
+                ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anoisesrc=d=${DURATION}:c=brown:r=44100:a=0.02" -af "lowpass=f=800,aecho=0.8:0.9:1000:0.3" -t "$DURATION" -c:a libmp3lame -b:a 128k bg_music.mp3 2>&1 || true ;;
             esac
           fi
 
-          # -------------------------------
-          # Build final audio and mux
-          # -------------------------------
+          # ===== Build final audio and mux =====
           if [ -f voiceover.mp3 ] && [ -f bg_music.mp3 ]; then
             ffmpeg -y -hide_banner -loglevel error \
               -i voiceover.mp3 -i bg_music.mp3 \
               -filter_complex "[0:a]volume=1.0[vo];[1:a]volume=0.15[bg];[vo][bg]amix=inputs=2:duration=longest[a]" \
-              -map "[a]" -t "$DURATION" -c:a aac -b:a 192k final_audio.m4a
+              -map "[a]" -t "$DURATION" -c:a aac -b:a 192k final_audio.m4a 2>&1 || true
           elif [ -f voiceover.mp3 ]; then
-            ffmpeg -y -hide_banner -loglevel error -i voiceover.mp3 -t "$DURATION" -c:a aac -b:a 192k final_audio.m4a
+            ffmpeg -y -hide_banner -loglevel error -i voiceover.mp3 -t "$DURATION" -c:a aac -b:a 192k final_audio.m4a 2>&1 || true
           elif [ -f bg_music.mp3 ]; then
-            ffmpeg -y -hide_banner -loglevel error -i bg_music.mp3 -t "$DURATION" -c:a aac -b:a 192k final_audio.m4a
+            ffmpeg -y -hide_banner -loglevel error -i bg_music.mp3 -t "$DURATION" -c:a aac -b:a 192k final_audio.m4a 2>&1 || true
           else
-            ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anullsrc=r=44100:cl=stereo" -t "$DURATION" -c:a aac -b:a 128k final_audio.m4a
+            ffmpeg -y -hide_banner -loglevel error -f lavfi -i "anullsrc=r=44100:cl=stereo" -t "$DURATION" -c:a aac -b:a 128k final_audio.m4a 2>&1 || true
+          fi
+
+          if [ ! -f final_audio.m4a ]; then
+            echo "ERROR: Failed to create audio"
+            exit 1
           fi
 
           ffmpeg -y -hide_banner -loglevel error \
             -i base_video.mp4 -i final_audio.m4a \
             -map 0:v -map 1:a \
-            -c:v copy -c:a aac -shortest -movflags +faststart output.mp4
+            -c:v copy -c:a aac -shortest -movflags +faststart output.mp4 2>&1 || true
 
-          # -------------------------------
-          # Optional captions
-          # -------------------------------
+          # ===== Optional captions =====
           if [ "$CAPTIONS" = "true" ] && [ "$SCRIPT_LEN" -gt 5 ]; then
             cat > captions.py << 'PYEOF'
 import json
@@ -271,11 +290,11 @@ from pathlib import Path
 
 text = Path('script_text.txt').read_text(encoding='utf-8').strip()
 if not text:
-    raise SystemExit(0)
+    exit(0)
 
 sentences = [s.strip() for s in re.split(r'(?<=[.!?\u0964])\s+', text) if s.strip()]
 if not sentences:
-    raise SystemExit(0)
+    exit(0)
 
 try:
     probe = subprocess.run(
@@ -284,13 +303,15 @@ try:
         text=True,
         check=False,
     )
-    duration = float(json.loads(probe.stdout)['format']['duration'])
-except Exception:
+    data = json.loads(probe.stdout)
+    duration = float(data.get('format', {}).get('duration', 60))
+except Exception as e:
+    print(f"Probe error: {e}")
     duration = 60.0
 
 tp = duration / max(len(sentences), 1)
 
-def fmt(t: float) -> str:
+def fmt(t):
     h = int(t // 3600)
     m = int((t % 3600) // 60)
     s = t % 60
@@ -311,7 +332,7 @@ PYEOF
                 -i output.mp4 \
                 -vf "subtitles=captions.srt:force_style='FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1,MarginV=30'" \
                 -c:v libx264 -preset veryfast -crf 23 \
-                -c:a copy -movflags +faststart output_captioned.mp4 || true
+                -c:a copy -movflags +faststart output_captioned.mp4 2>&1 || true
 
               if [ -f output_captioned.mp4 ]; then
                 mv output_captioned.mp4 output.mp4
@@ -326,7 +347,12 @@ PYEOF
               -f lavfi -i "anullsrc=r=44100:cl=stereo" \
               -t "$DURATION" \
               -c:v libx264 -preset veryfast -crf 23 \
-              -c:a aac -b:a 128k -shortest -movflags +faststart output.mp4
+              -c:a aac -b:a 128k -shortest -movflags +faststart output.mp4 2>&1 || true
+          fi
+
+          if [ ! -f output.mp4 ]; then
+            echo "FATAL: Could not create output.mp4"
+            exit 1
           fi
 
           ls -lh output.mp4
@@ -341,15 +367,17 @@ PYEOF
           FILE_NAME="renders/github-${RENDER_ID}.mp4"
 
           SERVICE_KEY="${SUPABASE_SERVICE_KEY}"
+          AUTH_HEADER=""
+          
           if [[ "$SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_HEADER=( -H "apikey: $SERVICE_KEY" )
+            AUTH_HEADER="-H apikey:${SERVICE_KEY}"
           else
-            AUTH_HEADER=( -H "Authorization: Bearer $SERVICE_KEY" )
+            AUTH_HEADER="-H Authorization:Bearer ${SERVICE_KEY}"
           fi
 
           HTTP_CODE=$(curl -sS -w "%{http_code}" -o /tmp/upload_resp.txt \
             -X POST "${SUPABASE_URL}/storage/v1/object/renders/${FILE_NAME}" \
-            "${AUTH_HEADER[@]}" \
+            ${AUTH_HEADER} \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: video/mp4" \
             -H "x-upsert: true" \
@@ -361,7 +389,7 @@ PYEOF
             echo "video_url=$VIDEO_URL" >> "$GITHUB_OUTPUT"
             echo "success=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Upload failed"
+            echo "Upload failed with status $HTTP_CODE"
             cat /tmp/upload_resp.txt || true
             echo "success=false" >> "$GITHUB_OUTPUT"
           fi
@@ -385,4 +413,4 @@ PYEOF
           curl -sS -X POST "${SUPABASE_URL}/functions/v1/kaggle-render" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
             -H "Content-Type: application/json" \
-            -d "$BODY"
+            -d "$BODY" || echo "Warning: Callback failed"
