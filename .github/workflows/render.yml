@@ -53,26 +53,21 @@ jobs:
       - name: Mark rendering
         run: |
           RID="${{ steps.params.outputs.render_id }}"
-          if [[ "$SUPABASE_SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_H="apikey: $SUPABASE_SERVICE_KEY"
-          else
-            AUTH_H="Authorization: Bearer $SUPABASE_SERVICE_KEY"
-          fi
+          # Unified Auth Header for Supabase
+          AUTH_H="Authorization: Bearer $SUPABASE_SERVICE_KEY"
+          
           curl -sS -X PATCH "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID" \
-            -H "$AUTH_H" -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "$AUTH_H" -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" -H "Prefer: return=minimal" \
             -d '{"status":"rendering"}' >/dev/null
 
       - name: Fetch render data
         run: |
           RID="${{ steps.params.outputs.render_id }}"
-          if [[ "$SUPABASE_SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_H="apikey: $SUPABASE_SERVICE_KEY"
-          else
-            AUTH_H="Authorization: Bearer $SUPABASE_SERVICE_KEY"
-          fi
+          AUTH_H="Authorization: Bearer $SUPABASE_SERVICE_KEY"
+          
           curl -sS "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID&select=*" \
-            -H "$AUTH_H" -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "$AUTH_H" -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" -o /tmp/render_data.json
           test "$(jq 'length' /tmp/render_data.json)" -gt 0 || { echo "No render found"; exit 1; }
 
@@ -82,7 +77,6 @@ jobs:
           import json, os, re, subprocess, asyncio
           from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor
-
           import edge_tts
 
           THREADS = "4"
@@ -142,13 +136,11 @@ jobs:
               script = str(vp.get("script_content","")).strip()
               Path("script.txt").write_text(script, encoding="utf-8")
 
-              # TTS
               vo = Path("vo.mp3")
               if len(script)>5:
                   try: asyncio.run(gen_voice(script, vo))
                   except: pass
 
-              # Parallel asset downloads
               assets = data.get("asset_urls") or []
               dl_tasks = []
               for i,a in enumerate(assets):
@@ -166,7 +158,6 @@ jobs:
                       results = list(ex.map(dl_one, dl_tasks))
                       downloaded = [r for r in results if r]
 
-              # Build clips (ultrafast for max speed)
               clips = []
               seg = max(3, min(6, dur//8 if dur>0 else 4))
               VF = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
@@ -184,7 +175,6 @@ jobs:
                   if ok and out.exists() and out.stat().st_size>0:
                       clips.append(out)
 
-              # Concat
               base = Path("base.mp4")
               if clips:
                   Path("concat.txt").write_text("\n".join(f"file '{c.name}'" for c in clips))
@@ -192,7 +182,6 @@ jobs:
               if not base.exists():
                   ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}","-t",str(dur),"-c:v","libx264","-preset","ultrafast","-crf","26","-threads",THREADS,"-an",str(base)])
 
-              # Audio
               bgm = Path("bgm.mp3")
               if bg not in ("none",""):
                   if bg=="lofi":
@@ -212,11 +201,9 @@ jobs:
               else:
                   ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t",str(dur),"-c:a","aac","-b:a","128k",str(audio)])
 
-              # Mux
               out = Path("output.mp4")
               ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(base),"-i",str(audio),"-map","0:v","-map","1:a","-c:v","copy","-c:a","aac","-shortest","-movflags","+faststart",str(out)])
 
-              # Captions
               if captions and len(script)>5 and out.exists():
                   srt = Path("captions.srt")
                   if make_srt(script, float(dur), srt):
@@ -224,7 +211,6 @@ jobs:
                       if ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(out),"-vf",f"subtitles=captions.srt:force_style='FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1,MarginV=30'","-c:v","libx264","-preset","ultrafast","-crf","26","-threads",THREADS,"-c:a","copy","-movflags","+faststart",str(cap)]):
                           if cap.exists(): cap.replace(out)
 
-              # Fallback
               if not out.exists():
                   ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t",str(dur),"-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart",str(out)])
 
@@ -253,22 +239,26 @@ jobs:
           RID="${{ steps.params.outputs.render_id }}"
           FILE="${{ steps.render.outputs.output_path }}"
           OBJ="github-${RID}.mp4"
-          if [[ "$SUPABASE_SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_H="apikey: $SUPABASE_SERVICE_KEY"
-          else
-            AUTH_H="Authorization: Bearer $SUPABASE_SERVICE_KEY"
-          fi
+          
+          # Force Authorization: Bearer header
+          AUTH_H="Authorization: Bearer $SUPABASE_SERVICE_KEY"
+          
           HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
             -X POST "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
-            -H "$AUTH_H" -H "apikey: $SUPABASE_ANON_KEY" \
-            -H "Content-Type: video/mp4" -H "x-upsert: true" \
+            -H "$AUTH_H" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: video/mp4" \
+            -H "x-upsert: true" \
             --data-binary @"$FILE")
+          
           if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]; then
             echo "video_url=$SUPABASE_URL/storage/v1/object/public/renders/$OBJ" >> "$GITHUB_OUTPUT"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            cat /tmp/up.txt || true
+            echo "Storage upload failed with status: $HTTP"
+            cat /tmp/up.txt
             echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 1 # Fail the step if upload fails
           fi
 
       - name: Callback
@@ -281,7 +271,7 @@ jobs:
           if [ "$OK" = "true" ] && [ -n "$URL" ]; then
             BODY=$(jq -nc --arg a "$CB" --arg r "$RID" --arg u "$URL" '{action:$a,pending_render_id:$r,video_url:$u}')
           else
-            BODY=$(jq -nc --arg a "$CB" --arg r "$RID" --arg e "render failed" '{action:$a,pending_render_id:$r,error:$e}')
+            BODY=$(jq -nc --arg a "$CB" --arg r "$RID" --arg e "render or upload failed" '{action:$a,pending_render_id:$r,error:$e}')
           fi
           curl -sS -X POST "$SUPABASE_URL/functions/v1/kaggle-render" \
             -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" \
