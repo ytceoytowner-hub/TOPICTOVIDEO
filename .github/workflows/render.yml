@@ -46,34 +46,53 @@ jobs:
           test -n "$SUPABASE_ANON_KEY" || { echo "Missing SUPABASE_ANON_KEY"; exit 1; }
           test -n "$SUPABASE_SERVICE_KEY" || { echo "Missing SUPABASE_SERVICE_KEY"; exit 1; }
 
+      - name: Setup auth headers
+        id: auth
+        run: |
+          # Detect key format and build correct headers
+          # Lovable Cloud keys do NOT start with eyJ — they go as apikey
+          # Standard Supabase JWT keys start with eyJ — they go as Bearer
+          if echo "$SUPABASE_SERVICE_KEY" | grep -q "^eyJ"; then
+            echo "Using JWT auth (Bearer token)"
+            echo "h1=apikey: $SUPABASE_ANON_KEY" >> "$GITHUB_OUTPUT"
+            echo "h2=Authorization: Bearer $SUPABASE_SERVICE_KEY" >> "$GITHUB_OUTPUT"
+          else
+            echo "Using Lovable Cloud auth (apikey)"
+            echo "h1=apikey: $SUPABASE_SERVICE_KEY" >> "$GITHUB_OUTPUT"
+            echo "h2=Authorization: Bearer $SUPABASE_SERVICE_KEY" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install deps
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq
           python3 -m pip install --break-system-packages edge-tts 2>/dev/null || pip install edge-tts
 
-      - name: Mark rendering and fetch job
+      - name: Mark rendering
         run: |
           RID="${{ steps.params.outputs.render_id }}"
-          echo "Render ID: $RID"
-          
-          curl -v -X PATCH "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID" \
-            -H "apikey: $SUPABASE_SERVICE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+          curl -sS -X PATCH "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID" \
+            -H "${{ steps.auth.outputs.h1 }}" \
+            -H "${{ steps.auth.outputs.h2 }}" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
-            -d '{"status":"rendering","error_message":null}'
+            -d '{"status":"rendering","error_message":null}' || true
 
-          curl -v "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID&select=*" \
-            -H "apikey: $SUPABASE_SERVICE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+      - name: Fetch render data
+        run: |
+          RID="${{ steps.params.outputs.render_id }}"
+          curl -sS "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID&select=*" \
+            -H "${{ steps.auth.outputs.h1 }}" \
+            -H "${{ steps.auth.outputs.h2 }}" \
             -H "Content-Type: application/json" \
             -o /tmp/render_data.json
-
-          test "$(jq 'length' /tmp/render_data.json 2>/dev/null)" -gt 0 || { echo "Error: No render found. Check ID and Keys."; exit 1; }
+          echo "Response:"
+          cat /tmp/render_data.json || true
+          echo ""
+          test "$(jq 'length' /tmp/render_data.json 2>/dev/null)" -gt 0 || { echo "No render found"; exit 1; }
 
       - name: Write render script
         run: |
-          cat > /tmp/render_raw.py << 'PYEOF'
+          cat > /tmp/render.py << 'PYEOF'
           import asyncio, json, os, re, subprocess
           from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
@@ -103,8 +122,22 @@ jobs:
               run(["curl","-fsSL","--retry","2","--connect-timeout","10","-o",str(out),str(url)])
               return out if out.exists() and out.stat().st_size > 0 else None
 
-          async def gen_voice(text, out):
-              hindi = bool(re.search(r'[\u0900-\u097F]', text))
+          def make_srt(text, dur, out):
+              parts = [s.strip() for s in re.split(r'(?<=[.!?\u0964])\s+', text) if s.strip()]
+              if not parts:
+                  return False
+              per = max(dur / max(len(parts), 1), 0.8)
+              def fmt(t):
+                  h, m = int(t // 3600), int((t % 3600) // 60)
+                  return f"{h:02d}:{m:02d}:{t % 60:06.3f}".replace('.', ',')
+              lines = []
+              for i, p in enumerate(parts):
+                  lines.append(f"{i+1}\n{fmt(i*per)} --> {fmt(min((i+1)*per, dur))}\n{p}\n")
+              out.write_text("\n".join(lines), encoding="utf-8")
+              return True
+
+          async def gen_voice(text, out, language="en"):
+              hindi = language == "hi" or bool(re.search(r'[\u0900-\u097F]', text))
               v = "hi-IN-SwaraNeural" if hindi else "en-US-AndrewMultilingualNeural"
               c = edge_tts.Communicate(text=text[:5000], voice=v, rate="+4%", pitch="+2Hz")
               await c.save(str(out))
@@ -115,18 +148,19 @@ jobs:
               os.chdir(W)
               data = json.loads(Path("/tmp/render_data.json").read_text())[0]
               vp = data.get("video_params") or {}
-              
-              res = str(vp.get("resolution", "1080x1920"))
-              w, h = (int(x) for x in (res.split("x",1) if "x" in res else ["1080","1920"]))
+              res = str(vp.get("resolution", "1920x1080"))
+              w, h = (int(x) for x in (res.split("x", 1) if "x" in res else ["1920", "1080"]))
               fps = int(vp.get("fps", 30))
               dur = max(int(vp.get("duration", 60)), 5)
               bg = str(vp.get("bg_music", "none") or "none")
+              captions = vp.get("captions") is True
+              language = str(vp.get("language", "en") or "en")
               script = str(vp.get("script_content", "") or "").strip()
 
               vo = W / "vo.mp3"
               if len(script) > 5:
                   try:
-                      asyncio.run(gen_voice(script, vo))
+                      asyncio.run(gen_voice(script, vo, language))
                   except Exception:
                       pass
 
@@ -191,6 +225,15 @@ jobs:
               out = Path("output.mp4")
               ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(base),"-i",str(audio),"-map","0:v","-map","1:a","-c:v","copy","-c:a","aac","-shortest","-movflags","+faststart",str(out)])
 
+              if captions and len(script) > 5 and out.exists():
+                  srt = Path("captions.srt")
+                  if make_srt(script, float(dur), srt):
+                      cap = Path("cap.mp4")
+                      style = "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1,MarginV=30"
+                      if ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(out),"-vf",f"subtitles=captions.srt:force_style='{style}'","-c:v","libx264","-preset","ultrafast","-crf","26","-threads",THREADS,"-c:a","copy","-movflags","+faststart",str(cap)]):
+                          if cap.exists():
+                              cap.replace(out)
+
               if not (out.exists() and out.stat().st_size > 0):
                   ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t",str(dur),"-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart",str(out)])
 
@@ -201,10 +244,10 @@ jobs:
                   main()
               except Exception:
                   Path("/tmp/rw").mkdir(parents=True, exist_ok=True)
-                  run(["ffmpeg","-y","-f","lavfi","-i","color=c=black:s=1080x1920:r=30","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t","10","-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart","/tmp/rw/output.mp4"])
+                  run(["ffmpeg","-y","-f","lavfi","-i","color=c=black:s=1920x1080:r=30","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t","10","-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart","/tmp/rw/output.mp4"])
                   Path("/tmp/output_path.txt").write_text("/tmp/rw/output.mp4")
           PYEOF
-          python3 -c "import textwrap; open('/tmp/render.py', 'w').write(textwrap.dedent(open('/tmp/render_raw.py').read()))"
+          sed -i 's/^          //' /tmp/render.py
 
       - name: Run render
         id: render
@@ -212,6 +255,7 @@ jobs:
           python3 /tmp/render.py
           OUTPUT=$(cat /tmp/output_path.txt)
           test -f "$OUTPUT" || { echo "No output"; exit 1; }
+          ls -lh "$OUTPUT"
           echo "output_path=$OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload
@@ -225,8 +269,19 @@ jobs:
           while [ "$ATTEMPT" -le 3 ]; do
             HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
               -X POST "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
-              -H "apikey: $SUPABASE_SERVICE_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "${{ steps.auth.outputs.h1 }}" \
+              -H "${{ steps.auth.outputs.h2 }}" \
+              -H "Content-Type: video/mp4" \
+              -H "x-upsert: true" \
+              --data-binary @"$FILE")
+            if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]; then
+              OK=true
+              break
+            fi
+            HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
+              -X PUT "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
+              -H "${{ steps.auth.outputs.h1 }}" \
+              -H "${{ steps.auth.outputs.h2 }}" \
               -H "Content-Type: video/mp4" \
               -H "x-upsert: true" \
               --data-binary @"$FILE")
@@ -241,6 +296,8 @@ jobs:
             echo "video_url=$SUPABASE_URL/storage/v1/object/public/renders/$OBJ" >> "$GITHUB_OUTPUT"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
+            echo "Upload failed:"
+            cat /tmp/up.txt || true
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
