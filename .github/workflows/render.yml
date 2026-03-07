@@ -55,29 +55,25 @@ jobs:
         run: |
           RID="${{ steps.params.outputs.render_id }}"
           echo "Render ID: $RID"
-          echo "Supabase URL: $SUPABASE_URL"
-
+          
           curl -v -X PATCH "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID" \
-            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
-            -d '{"status":"rendering","error_message":null}' 2>&1 || true
+            -d '{"status":"rendering","error_message":null}'
 
           curl -v "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID&select=*" \
-            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
-            -o /tmp/render_data.json 2>&1
+            -o /tmp/render_data.json
 
-          echo "Response:"
-          cat /tmp/render_data.json || true
-          echo ""
-          test "$(jq 'length' /tmp/render_data.json 2>/dev/null)" -gt 0 || { echo "No render found"; exit 1; }
+          test "$(jq 'length' /tmp/render_data.json 2>/dev/null)" -gt 0 || { echo "Error: No render found. Check ID and Keys."; exit 1; }
 
       - name: Write render script
         run: |
-          cat > /tmp/render.py << 'PYEOF'
+          cat > /tmp/render_raw.py << 'PYEOF'
           import asyncio, json, os, re, subprocess
           from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
@@ -119,8 +115,9 @@ jobs:
               os.chdir(W)
               data = json.loads(Path("/tmp/render_data.json").read_text())[0]
               vp = data.get("video_params") or {}
-              res = str(vp.get("resolution", "1920x1080"))
-              w, h = (int(x) for x in (res.split("x",1) if "x" in res else ["1920","1080"]))
+              
+              res = str(vp.get("resolution", "1080x1920"))
+              w, h = (int(x) for x in (res.split("x",1) if "x" in res else ["1080","1920"]))
               fps = int(vp.get("fps", 30))
               dur = max(int(vp.get("duration", 60)), 5)
               bg = str(vp.get("bg_music", "none") or "none")
@@ -204,10 +201,10 @@ jobs:
                   main()
               except Exception:
                   Path("/tmp/rw").mkdir(parents=True, exist_ok=True)
-                  run(["ffmpeg","-y","-f","lavfi","-i","color=c=black:s=1920x1080:r=30","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t","10","-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart","/tmp/rw/output.mp4"])
+                  run(["ffmpeg","-y","-f","lavfi","-i","color=c=black:s=1080x1920:r=30","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t","10","-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart","/tmp/rw/output.mp4"])
                   Path("/tmp/output_path.txt").write_text("/tmp/rw/output.mp4")
           PYEOF
-          sed -i 's/^          //' /tmp/render.py
+          python3 -c "import textwrap; open('/tmp/render.py', 'w').write(textwrap.dedent(open('/tmp/render_raw.py').read()))"
 
       - name: Run render
         id: render
@@ -215,7 +212,6 @@ jobs:
           python3 /tmp/render.py
           OUTPUT=$(cat /tmp/output_path.txt)
           test -f "$OUTPUT" || { echo "No output"; exit 1; }
-          ls -lh "$OUTPUT"
           echo "output_path=$OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload
@@ -229,18 +225,7 @@ jobs:
           while [ "$ATTEMPT" -le 3 ]; do
             HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
               -X POST "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
-              -H "apikey: $SUPABASE_ANON_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-              -H "Content-Type: video/mp4" \
-              -H "x-upsert: true" \
-              --data-binary @"$FILE")
-            if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]; then
-              OK=true
-              break
-            fi
-            HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
-              -X PUT "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
-              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
               -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
               -H "Content-Type: video/mp4" \
               -H "x-upsert: true" \
@@ -256,8 +241,6 @@ jobs:
             echo "video_url=$SUPABASE_URL/storage/v1/object/public/renders/$OBJ" >> "$GITHUB_OUTPUT"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Upload failed, response:"
-            cat /tmp/up.txt || true
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
