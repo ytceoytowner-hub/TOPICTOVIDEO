@@ -95,294 +95,299 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/render.py << 'PYEOF'
-import asyncio
-import json
-import re
-import subprocess
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+          python3 -c "
+          import base64, pathlib
+          pathlib.Path('/tmp/render.py').write_bytes(base64.b64decode(pathlib.Path('/tmp/render.py.b64').read_text()))
+          "  2>/dev/null || true
+          cat > /tmp/render.py << 'INNER_EOF'
+          import asyncio
+          import json
+          import re
+          import subprocess
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
 
-import edge_tts
+          import edge_tts
 
-THREADS = "4"
-
-
-def run(cmd):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-
-def ffmpeg(cmd):
-    p = run(cmd)
-    return p.returncode == 0
+          THREADS = "4"
 
 
-def detect_kind(path: Path):
-    p = run([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_type", "-of", "json", str(path),
-    ])
-    try:
-        data = json.loads(p.stdout or "{}")
-        if data.get("streams"):
-            return "video"
-    except Exception:
-        pass
-    if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-        return "image"
-    return "unknown"
+          def run(cmd):
+              return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-def dl_one(task):
-    i, url = task
-    out = Path(f"asset_{i}.bin")
-    p = run(["curl", "-fL", "--retry", "3", "--retry-delay", "1", "--connect-timeout", "10", "-o", str(out), str(url)])
-    if p.returncode == 0 and out.exists() and out.stat().st_size > 0:
-        return out
-    return None
+          def ffmpeg(cmd):
+              p = run(cmd)
+              return p.returncode == 0
 
 
-async def make_voice(text: str, out: Path):
-    text = (text or "").strip()[:5000]
-    if len(text) < 4:
-        return
-    hindi = bool(re.search(r"[\u0900-\u097F]", text))
-    voice = "hi-IN-SwaraNeural" if hindi else "en-US-AndrewMultilingualNeural"
-    tts = edge_tts.Communicate(text=text, voice=voice, rate="+4%", pitch="+2Hz")
-    await tts.save(str(out))
+          def detect_kind(path: Path):
+              p = run([
+                  "ffprobe", "-v", "error", "-select_streams", "v:0",
+                  "-show_entries", "stream=codec_type", "-of", "json", str(path),
+              ])
+              try:
+                  data = json.loads(p.stdout or "{}")
+                  if data.get("streams"):
+                      return "video"
+              except Exception:
+                  pass
+              if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                  return "image"
+              return "unknown"
 
 
-def black_video(out: Path, w: int, h: int, fps: int, dur: int):
-    return ffmpeg([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}",
-        "-t", str(dur),
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-        "-threads", THREADS, "-pix_fmt", "yuv420p", "-an", str(out),
-    ])
+          def dl_one(task):
+              i, url = task
+              out = Path(f"asset_{i}.bin")
+              p = run(["curl", "-fL", "--retry", "3", "--retry-delay", "1", "--connect-timeout", "10", "-o", str(out), str(url)])
+              if p.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                  return out
+              return None
 
 
-def build_video(downloaded, w, h, fps, dur, wd: Path):
-    vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-    seg = max(3, min(6, dur // 8 if dur > 0 else 4))
-    clips = []
-
-    for i, src in enumerate(downloaded):
-        kind = detect_kind(src)
-        clip = wd / f"c_{i:03d}.mp4"
-        if kind == "video":
-            ok = ffmpeg([
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-stream_loop", "-1", "-i", str(src),
-                "-t", str(seg), "-vf", vf, "-r", str(fps),
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                "-threads", THREADS, "-an", str(clip),
-            ])
-        elif kind == "image":
-            ok = ffmpeg([
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-loop", "1", "-i", str(src),
-                "-t", str(seg), "-vf", vf, "-r", str(fps),
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                "-threads", THREADS, "-an", str(clip),
-            ])
-        else:
-            ok = False
-
-        if ok and clip.exists() and clip.stat().st_size > 0:
-            clips.append(clip)
-
-    base = wd / "base.mp4"
-    if clips:
-        (wd / "concat.txt").write_text("\n".join(f"file '{c.name}'" for c in clips), encoding="utf-8")
-        ok = ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", str(wd / "concat.txt"),
-            "-t", str(dur), "-vf", f"fps={fps},format=yuv420p",
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-            "-threads", THREADS, "-an", str(base),
-        ])
-        if ok and base.exists() and base.stat().st_size > 0:
-            return base
-
-    black_video(base, w, h, fps, dur)
-    return base
+          async def make_voice(text: str, out: Path):
+              text = (text or "").strip()[:5000]
+              if len(text) < 4:
+                  return
+              hindi = bool(re.search(r"[\u0900-\u097F]", text))
+              voice = "hi-IN-SwaraNeural" if hindi else "en-US-AndrewMultilingualNeural"
+              tts = edge_tts.Communicate(text=text, voice=voice, rate="+4%", pitch="+2Hz")
+              await tts.save(str(out))
 
 
-def build_music(style: str, dur: int, out: Path):
-    if style in ("", "none"):
-        return
-    if style == "lofi":
-        ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", f"anoisesrc=d={dur}:c=pink:r=44100:a=0.02",
-            "-af", "lowpass=f=3000,bass=g=5", "-t", str(dur),
-            "-c:a", "libmp3lame", "-b:a", "128k", str(out),
-        ])
-    elif style == "cinematic":
-        ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", f"sine=f=220:d={dur}",
-            "-f", "lavfi", "-i", f"sine=f=330:d={dur}",
-            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest,volume=0.05,aecho=0.8:0.88:60:0.4",
-            "-t", str(dur), "-c:a", "libmp3lame", "-b:a", "128k", str(out),
-        ])
-    else:
-        ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", f"anoisesrc=d={dur}:c=white:r=44100:a=0.015",
-            "-af", "highpass=f=500", "-t", str(dur),
-            "-c:a", "libmp3lame", "-b:a", "128k", str(out),
-        ])
+          def black_video(out: Path, w: int, h: int, fps: int, dur: int):
+              return ffmpeg([
+                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                  "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}",
+                  "-t", str(dur),
+                  "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
+                  "-threads", THREADS, "-pix_fmt", "yuv420p", "-an", str(out),
+              ])
 
 
-def build_audio(vo: Path, bgm: Path, dur: int, out: Path):
-    if vo.exists() and bgm.exists():
-        ok = ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(vo), "-i", str(bgm),
-            "-filter_complex", "[0:a]volume=1.0[v];[1:a]volume=0.14[b];[v][b]amix=inputs=2:duration=longest[a]",
-            "-map", "[a]", "-t", str(dur), "-c:a", "aac", "-b:a", "192k", str(out),
-        ])
-        if ok and out.exists() and out.stat().st_size > 0:
-            return
+          def build_video(downloaded, w, h, fps, dur, wd: Path):
+              vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+              seg = max(3, min(6, dur // 8 if dur > 0 else 4))
+              clips = []
 
-    if vo.exists():
-        ok = ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(vo), "-map", "0:a:0", "-t", str(dur), "-c:a", "aac", "-b:a", "192k", str(out),
-        ])
-        if ok and out.exists() and out.stat().st_size > 0:
-            return
+              for i, src in enumerate(downloaded):
+                  kind = detect_kind(src)
+                  clip = wd / f"c_{i:03d}.mp4"
+                  if kind == "video":
+                      ok = ffmpeg([
+                          "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                          "-stream_loop", "-1", "-i", str(src),
+                          "-t", str(seg), "-vf", vf, "-r", str(fps),
+                          "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
+                          "-threads", THREADS, "-an", str(clip),
+                      ])
+                  elif kind == "image":
+                      ok = ffmpeg([
+                          "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                          "-loop", "1", "-i", str(src),
+                          "-t", str(seg), "-vf", vf, "-r", str(fps),
+                          "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
+                          "-threads", THREADS, "-an", str(clip),
+                      ])
+                  else:
+                      ok = False
 
-    if bgm.exists():
-        ok = ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(bgm), "-map", "0:a:0", "-t", str(dur), "-c:a", "aac", "-b:a", "160k", str(out),
-        ])
-        if ok and out.exists() and out.stat().st_size > 0:
-            return
+                  if ok and clip.exists() and clip.stat().st_size > 0:
+                      clips.append(clip)
 
-    ffmpeg([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-        "-t", str(dur), "-c:a", "aac", "-b:a", "128k", str(out),
-    ])
+              base = wd / "base.mp4"
+              if clips:
+                  (wd / "concat.txt").write_text("\n".join(f"file '{c.name}'" for c in clips), encoding="utf-8")
+                  ok = ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "concat", "-safe", "0", "-i", str(wd / "concat.txt"),
+                      "-t", str(dur), "-vf", f"fps={fps},format=yuv420p",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
+                      "-threads", THREADS, "-an", str(base),
+                  ])
+                  if ok and base.exists() and base.stat().st_size > 0:
+                      return base
 
-
-def main():
-    wd = Path("/tmp/rw")
-    wd.mkdir(parents=True, exist_ok=True)
-
-    rows = json.loads(Path("/tmp/render_data.json").read_text(encoding="utf-8"))
-    if not rows:
-        raise RuntimeError("No render row")
-
-    row = rows[0]
-    vp = row.get("video_params") or {}
-    res = str(vp.get("resolution", "1920x1080"))
-    if "x" in res:
-        ws, hs = res.split("x", 1)
-    else:
-        ws, hs = "1920", "1080"
-
-    try:
-        w, h = int(ws), int(hs)
-    except Exception:
-        w, h = 1920, 1080
-
-    fps = int(vp.get("fps", 30))
-    dur = max(int(vp.get("duration", 60)), 5)
-    bg = str(vp.get("bg_music", "none") or "none")
-    script = str(vp.get("script_content", "") or "").strip()
-
-    voice = wd / "voice.mp3"
-    bgm = wd / "bgm.mp3"
-    audio = wd / "audio.m4a"
-    output = wd / "output.mp4"
-
-    if len(script) > 4:
-        try:
-            asyncio.run(make_voice(script, voice))
-        except Exception:
-            pass
-
-    assets = row.get("asset_urls") or []
-    tasks = []
-    for i, a in enumerate(assets):
-        if isinstance(a, dict):
-            url = a.get("url")
-            typ = (a.get("type") or "video").lower()
-        else:
-            url = a
-            typ = "video"
-
-        if not url:
-            continue
-        if typ == "voiceover" and not voice.exists():
-            run(["curl", "-fL", "--retry", "3", "--retry-delay", "1", "-o", str(voice), str(url)])
-        else:
-            tasks.append((i, url))
-
-    downloaded = []
-    if tasks:
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            for p in ex.map(dl_one, tasks):
-                if p:
-                    downloaded.append(p)
-
-    base = build_video(downloaded, w, h, fps, dur, wd)
-    build_music(bg, dur, bgm)
-    build_audio(voice, bgm, dur, audio)
-
-    ok = ffmpeg([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(base), "-i", str(audio),
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-        str(output),
-    ])
-
-    if not (ok and output.exists() and output.stat().st_size > 0):
-        black_video(base, w, h, fps, dur)
-        ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(base), "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-map", "0:v:0", "-map", "1:a:0", "-t", str(dur),
-            "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-            str(output),
-        ])
-
-    if not (output.exists() and output.stat().st_size > 0):
-        ffmpeg([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}",
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-map", "0:v:0", "-map", "1:a:0", "-t", str(dur),
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-            "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-            str(output),
-        ])
-
-    Path("/tmp/output_path.txt").write_text(str(output), encoding="utf-8")
+              black_video(base, w, h, fps, dur)
+              return base
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        fallback = Path("/tmp/rw/output.mp4")
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        run([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-map", "0:v:0", "-map", "1:a:0", "-t", "10",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-            "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(fallback),
-        ])
-        Path("/tmp/output_path.txt").write_text(str(fallback), encoding="utf-8")
-PYEOF
+          def build_music(style: str, dur: int, out: Path):
+              if style in ("", "none"):
+                  return
+              if style == "lofi":
+                  ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", f"anoisesrc=d={dur}:c=pink:r=44100:a=0.02",
+                      "-af", "lowpass=f=3000,bass=g=5", "-t", str(dur),
+                      "-c:a", "libmp3lame", "-b:a", "128k", str(out),
+                  ])
+              elif style == "cinematic":
+                  ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", f"sine=f=220:d={dur}",
+                      "-f", "lavfi", "-i", f"sine=f=330:d={dur}",
+                      "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest,volume=0.05,aecho=0.8:0.88:60:0.4",
+                      "-t", str(dur), "-c:a", "libmp3lame", "-b:a", "128k", str(out),
+                  ])
+              else:
+                  ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", f"anoisesrc=d={dur}:c=white:r=44100:a=0.015",
+                      "-af", "highpass=f=500", "-t", str(dur),
+                      "-c:a", "libmp3lame", "-b:a", "128k", str(out),
+                  ])
+
+
+          def build_audio(vo: Path, bgm: Path, dur: int, out: Path):
+              if vo.exists() and bgm.exists():
+                  ok = ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(vo), "-i", str(bgm),
+                      "-filter_complex", "[0:a]volume=1.0[v];[1:a]volume=0.14[b];[v][b]amix=inputs=2:duration=longest[a]",
+                      "-map", "[a]", "-t", str(dur), "-c:a", "aac", "-b:a", "192k", str(out),
+                  ])
+                  if ok and out.exists() and out.stat().st_size > 0:
+                      return
+
+              if vo.exists():
+                  ok = ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(vo), "-map", "0:a:0", "-t", str(dur), "-c:a", "aac", "-b:a", "192k", str(out),
+                  ])
+                  if ok and out.exists() and out.stat().st_size > 0:
+                      return
+
+              if bgm.exists():
+                  ok = ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(bgm), "-map", "0:a:0", "-t", str(dur), "-c:a", "aac", "-b:a", "160k", str(out),
+                  ])
+                  if ok and out.exists() and out.stat().st_size > 0:
+                      return
+
+              ffmpeg([
+                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                  "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                  "-t", str(dur), "-c:a", "aac", "-b:a", "128k", str(out),
+              ])
+
+
+          def main():
+              wd = Path("/tmp/rw")
+              wd.mkdir(parents=True, exist_ok=True)
+
+              rows = json.loads(Path("/tmp/render_data.json").read_text(encoding="utf-8"))
+              if not rows:
+                  raise RuntimeError("No render row")
+
+              row = rows[0]
+              vp = row.get("video_params") or {}
+              res = str(vp.get("resolution", "1920x1080"))
+              if "x" in res:
+                  ws, hs = res.split("x", 1)
+              else:
+                  ws, hs = "1920", "1080"
+
+              try:
+                  w, h = int(ws), int(hs)
+              except Exception:
+                  w, h = 1920, 1080
+
+              fps = int(vp.get("fps", 30))
+              dur = max(int(vp.get("duration", 60)), 5)
+              bg = str(vp.get("bg_music", "none") or "none")
+              script = str(vp.get("script_content", "") or "").strip()
+
+              voice = wd / "voice.mp3"
+              bgm = wd / "bgm.mp3"
+              audio = wd / "audio.m4a"
+              output = wd / "output.mp4"
+
+              if len(script) > 4:
+                  try:
+                      asyncio.run(make_voice(script, voice))
+                  except Exception:
+                      pass
+
+              assets = row.get("asset_urls") or []
+              tasks = []
+              for i, a in enumerate(assets):
+                  if isinstance(a, dict):
+                      url = a.get("url")
+                      typ = (a.get("type") or "video").lower()
+                  else:
+                      url = a
+                      typ = "video"
+
+                  if not url:
+                      continue
+                  if typ == "voiceover" and not voice.exists():
+                      run(["curl", "-fL", "--retry", "3", "--retry-delay", "1", "-o", str(voice), str(url)])
+                  else:
+                      tasks.append((i, url))
+
+              downloaded = []
+              if tasks:
+                  with ThreadPoolExecutor(max_workers=4) as ex:
+                      for p in ex.map(dl_one, tasks):
+                          if p:
+                              downloaded.append(p)
+
+              base = build_video(downloaded, w, h, fps, dur, wd)
+              build_music(bg, dur, bgm)
+              build_audio(voice, bgm, dur, audio)
+
+              ok = ffmpeg([
+                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                  "-i", str(base), "-i", str(audio),
+                  "-map", "0:v:0", "-map", "1:a:0",
+                  "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
+                  str(output),
+              ])
+
+              if not (ok and output.exists() and output.stat().st_size > 0):
+                  black_video(base, w, h, fps, dur)
+                  ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(base), "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                      "-map", "0:v:0", "-map", "1:a:0", "-t", str(dur),
+                      "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
+                      str(output),
+                  ])
+
+              if not (output.exists() and output.stat().st_size > 0):
+                  ffmpeg([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}",
+                      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                      "-map", "0:v:0", "-map", "1:a:0", "-t", str(dur),
+                      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
+                      "-c:a", "aac", "-shortest", "-movflags", "+faststart",
+                      str(output),
+                  ])
+
+              Path("/tmp/output_path.txt").write_text(str(output), encoding="utf-8")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  fallback = Path("/tmp/rw/output.mp4")
+                  fallback.parent.mkdir(parents=True, exist_ok=True)
+                  run([
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
+                      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                      "-map", "0:v:0", "-map", "1:a:0", "-t", "10",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+                      "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(fallback),
+                  ])
+                  Path("/tmp/output_path.txt").write_text(str(fallback), encoding="utf-8")
+          INNER_EOF
+          sed -i 's/^          //' /tmp/render.py
 
       - name: Run render
         id: render
