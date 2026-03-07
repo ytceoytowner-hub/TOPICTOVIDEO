@@ -29,9 +29,7 @@ jobs:
     steps:
       - name: Resolve parameters
         id: params
-        shell: bash
         run: |
-          set -euo pipefail
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "render_id=${{ github.event.client_payload.pending_render_id }}" >> "$GITHUB_OUTPUT"
             CB="${{ github.event.client_payload.callback_action }}"
@@ -42,443 +40,240 @@ jobs:
           echo "callback=${CB:-kaggle-callback}" >> "$GITHUB_OUTPUT"
 
       - name: Validate
-        shell: bash
         run: |
-          set -euo pipefail
           test -n "${{ steps.params.outputs.render_id }}" || { echo "Missing render_id"; exit 1; }
           test -n "$SUPABASE_URL" || { echo "Missing SUPABASE_URL"; exit 1; }
           test -n "$SUPABASE_ANON_KEY" || { echo "Missing SUPABASE_ANON_KEY"; exit 1; }
           test -n "$SUPABASE_SERVICE_KEY" || { echo "Missing SUPABASE_SERVICE_KEY"; exit 1; }
 
-      - name: Install dependencies
-        shell: bash
+      - name: Install deps
         run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg jq python3-pip
-          python3 -m pip install --upgrade --break-system-packages pip
-          python3 -m pip install --break-system-packages edge-tts
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq
+          python3 -m pip install --break-system-packages edge-tts 2>/dev/null || pip install edge-tts
 
       - name: Mark rendering and fetch job
-        shell: bash
         run: |
-          set -euo pipefail
           RID="${{ steps.params.outputs.render_id }}"
+          echo "Render ID: $RID"
+          echo "Supabase URL: $SUPABASE_URL"
 
-          if [[ "$SUPABASE_SERVICE_KEY" == sb_secret_* ]]; then
-            # New secret-style key: use it as apikey, keep Authorization present with anon bearer
-            AUTH_HEADER=(
-              -H "apikey: $SUPABASE_SERVICE_KEY"
-              -H "Authorization: Bearer $SUPABASE_ANON_KEY"
-            )
-          else
-            # Legacy JWT service key: use bearer auth + anon apikey
-            AUTH_HEADER=(
-              -H "apikey: $SUPABASE_ANON_KEY"
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
-            )
-          fi
-
-          curl -sS -X PATCH "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID" \
-            "${AUTH_HEADER[@]}" \
-            -H "Content-Type: application/json" -H "Prefer: return=minimal" \
-            -d '{"status":"rendering","error_message":null}' >/dev/null
-
-          curl -sS "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID&select=*" \
-            "${AUTH_HEADER[@]}" \
+          curl -v -X PATCH "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
-            -o /tmp/render_data.json
+            -H "Prefer: return=minimal" \
+            -d '{"status":"rendering","error_message":null}' 2>&1 || true
 
-          test "$(jq 'length' /tmp/render_data.json)" -gt 0 || { echo "No render found"; exit 1; }
+          curl -v "$SUPABASE_URL/rest/v1/pending_renders?id=eq.$RID&select=*" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -o /tmp/render_data.json 2>&1
+
+          echo "Response:"
+          cat /tmp/render_data.json || true
+          echo ""
+          test "$(jq 'length' /tmp/render_data.json 2>/dev/null)" -gt 0 || { echo "No render found"; exit 1; }
 
       - name: Write render script
-        shell: bash
         run: |
-          set -euo pipefail
-          python3 -c "
-          import base64, pathlib
-          pathlib.Path('/tmp/render.py').write_bytes(base64.b64decode(pathlib.Path('/tmp/render.py.b64').read_text()))
-          "  2>/dev/null || true
-          cat > /tmp/render.py << 'INNER_EOF'
-          import asyncio
-          import json
-          import re
-          import subprocess
+          cat > /tmp/render.py << 'PYEOF'
+          import asyncio, json, os, re, subprocess
           from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
-
           import edge_tts
 
           THREADS = "4"
 
-
           def run(cmd):
               return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-
           def ffmpeg(cmd):
-              p = run(cmd)
-              return p.returncode == 0
+              return run(cmd).returncode == 0
 
-
-          def detect_kind(path: Path):
-              p = run([
-                  "ffprobe", "-v", "error", "-select_streams", "v:0",
-                  "-show_entries", "stream=codec_type", "-of", "json", str(path),
-              ])
+          def detect_kind(p):
+              pr = run(["ffprobe","-v","error","-show_entries","stream=codec_type","-of","json",str(p)])
               try:
-                  data = json.loads(p.stdout or "{}")
-                  if data.get("streams"):
-                      return "video"
+                  for s in json.loads(pr.stdout or "{}").get("streams",[]):
+                      if s.get("codec_type") == "video":
+                          return "video"
               except Exception:
                   pass
-              if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-                  return "image"
-              return "unknown"
+              return "image" if p.suffix.lower() in {".jpg",".jpeg",".png",".webp",".bmp"} else "unknown"
 
-
-          def dl_one(task):
-              i, url = task
+          def dl_one(args):
+              i, url = args
               out = Path(f"asset_{i}.bin")
-              p = run(["curl", "-fL", "--retry", "3", "--retry-delay", "1", "--connect-timeout", "10", "-o", str(out), str(url)])
-              if p.returncode == 0 and out.exists() and out.stat().st_size > 0:
-                  return out
-              return None
+              run(["curl","-fsSL","--retry","2","--connect-timeout","10","-o",str(out),str(url)])
+              return out if out.exists() and out.stat().st_size > 0 else None
 
-
-          async def make_voice(text: str, out: Path):
-              text = (text or "").strip()[:5000]
-              if len(text) < 4:
-                  return
-              hindi = bool(re.search(r"[\u0900-\u097F]", text))
-              voice = "hi-IN-SwaraNeural" if hindi else "en-US-AndrewMultilingualNeural"
-              tts = edge_tts.Communicate(text=text, voice=voice, rate="+4%", pitch="+2Hz")
-              await tts.save(str(out))
-
-
-          def black_video(out: Path, w: int, h: int, fps: int, dur: int):
-              return ffmpeg([
-                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                  "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}",
-                  "-t", str(dur),
-                  "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                  "-threads", THREADS, "-pix_fmt", "yuv420p", "-an", str(out),
-              ])
-
-
-          def build_video(downloaded, w, h, fps, dur, wd: Path):
-              vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-              seg = max(3, min(6, dur // 8 if dur > 0 else 4))
-              clips = []
-
-              for i, src in enumerate(downloaded):
-                  kind = detect_kind(src)
-                  clip = wd / f"c_{i:03d}.mp4"
-                  if kind == "video":
-                      ok = ffmpeg([
-                          "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                          "-stream_loop", "-1", "-i", str(src),
-                          "-t", str(seg), "-vf", vf, "-r", str(fps),
-                          "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                          "-threads", THREADS, "-an", str(clip),
-                      ])
-                  elif kind == "image":
-                      ok = ffmpeg([
-                          "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                          "-loop", "1", "-i", str(src),
-                          "-t", str(seg), "-vf", vf, "-r", str(fps),
-                          "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                          "-threads", THREADS, "-an", str(clip),
-                      ])
-                  else:
-                      ok = False
-
-                  if ok and clip.exists() and clip.stat().st_size > 0:
-                      clips.append(clip)
-
-              base = wd / "base.mp4"
-              if clips:
-                  (wd / "concat.txt").write_text("\n".join(f"file '{c.name}'" for c in clips), encoding="utf-8")
-                  ok = ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-f", "concat", "-safe", "0", "-i", str(wd / "concat.txt"),
-                      "-t", str(dur), "-vf", f"fps={fps},format=yuv420p",
-                      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                      "-threads", THREADS, "-an", str(base),
-                  ])
-                  if ok and base.exists() and base.stat().st_size > 0:
-                      return base
-
-              black_video(base, w, h, fps, dur)
-              return base
-
-
-          def build_music(style: str, dur: int, out: Path):
-              if style in ("", "none"):
-                  return
-              if style == "lofi":
-                  ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-f", "lavfi", "-i", f"anoisesrc=d={dur}:c=pink:r=44100:a=0.02",
-                      "-af", "lowpass=f=3000,bass=g=5", "-t", str(dur),
-                      "-c:a", "libmp3lame", "-b:a", "128k", str(out),
-                  ])
-              elif style == "cinematic":
-                  ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-f", "lavfi", "-i", f"sine=f=220:d={dur}",
-                      "-f", "lavfi", "-i", f"sine=f=330:d={dur}",
-                      "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest,volume=0.05,aecho=0.8:0.88:60:0.4",
-                      "-t", str(dur), "-c:a", "libmp3lame", "-b:a", "128k", str(out),
-                  ])
-              else:
-                  ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-f", "lavfi", "-i", f"anoisesrc=d={dur}:c=white:r=44100:a=0.015",
-                      "-af", "highpass=f=500", "-t", str(dur),
-                      "-c:a", "libmp3lame", "-b:a", "128k", str(out),
-                  ])
-
-
-          def build_audio(vo: Path, bgm: Path, dur: int, out: Path):
-              if vo.exists() and bgm.exists():
-                  ok = ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-i", str(vo), "-i", str(bgm),
-                      "-filter_complex", "[0:a]volume=1.0[v];[1:a]volume=0.14[b];[v][b]amix=inputs=2:duration=longest[a]",
-                      "-map", "[a]", "-t", str(dur), "-c:a", "aac", "-b:a", "192k", str(out),
-                  ])
-                  if ok and out.exists() and out.stat().st_size > 0:
-                      return
-
-              if vo.exists():
-                  ok = ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-i", str(vo), "-map", "0:a:0", "-t", str(dur), "-c:a", "aac", "-b:a", "192k", str(out),
-                  ])
-                  if ok and out.exists() and out.stat().st_size > 0:
-                      return
-
-              if bgm.exists():
-                  ok = ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-i", str(bgm), "-map", "0:a:0", "-t", str(dur), "-c:a", "aac", "-b:a", "160k", str(out),
-                  ])
-                  if ok and out.exists() and out.stat().st_size > 0:
-                      return
-
-              ffmpeg([
-                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                  "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                  "-t", str(dur), "-c:a", "aac", "-b:a", "128k", str(out),
-              ])
-
+          async def gen_voice(text, out):
+              hindi = bool(re.search(r'[\u0900-\u097F]', text))
+              v = "hi-IN-SwaraNeural" if hindi else "en-US-AndrewMultilingualNeural"
+              c = edge_tts.Communicate(text=text[:5000], voice=v, rate="+4%", pitch="+2Hz")
+              await c.save(str(out))
 
           def main():
-              wd = Path("/tmp/rw")
-              wd.mkdir(parents=True, exist_ok=True)
-
-              rows = json.loads(Path("/tmp/render_data.json").read_text(encoding="utf-8"))
-              if not rows:
-                  raise RuntimeError("No render row")
-
-              row = rows[0]
-              vp = row.get("video_params") or {}
+              W = Path("/tmp/rw")
+              W.mkdir(parents=True, exist_ok=True)
+              os.chdir(W)
+              data = json.loads(Path("/tmp/render_data.json").read_text())[0]
+              vp = data.get("video_params") or {}
               res = str(vp.get("resolution", "1920x1080"))
-              if "x" in res:
-                  ws, hs = res.split("x", 1)
-              else:
-                  ws, hs = "1920", "1080"
-
-              try:
-                  w, h = int(ws), int(hs)
-              except Exception:
-                  w, h = 1920, 1080
-
+              w, h = (int(x) for x in (res.split("x",1) if "x" in res else ["1920","1080"]))
               fps = int(vp.get("fps", 30))
               dur = max(int(vp.get("duration", 60)), 5)
               bg = str(vp.get("bg_music", "none") or "none")
               script = str(vp.get("script_content", "") or "").strip()
 
-              voice = wd / "voice.mp3"
-              bgm = wd / "bgm.mp3"
-              audio = wd / "audio.m4a"
-              output = wd / "output.mp4"
-
-              if len(script) > 4:
+              vo = W / "vo.mp3"
+              if len(script) > 5:
                   try:
-                      asyncio.run(make_voice(script, voice))
+                      asyncio.run(gen_voice(script, vo))
                   except Exception:
                       pass
 
-              assets = row.get("asset_urls") or []
-              tasks = []
+              assets = data.get("asset_urls") or []
+              dl_tasks = []
               for i, a in enumerate(assets):
-                  if isinstance(a, dict):
-                      url = a.get("url")
-                      typ = (a.get("type") or "video").lower()
-                  else:
-                      url = a
-                      typ = "video"
-
+                  url = a.get("url") if isinstance(a, dict) else a
+                  typ = (a.get("type") if isinstance(a, dict) else "video") or "video"
                   if not url:
                       continue
-                  if typ == "voiceover" and not voice.exists():
-                      run(["curl", "-fL", "--retry", "3", "--retry-delay", "1", "-o", str(voice), str(url)])
+                  if typ == "voiceover" and not vo.exists():
+                      run(["curl","-fsSL","--retry","2","-o",str(vo),str(url)])
                   else:
-                      tasks.append((i, url))
+                      dl_tasks.append((i, url))
 
               downloaded = []
-              if tasks:
+              if dl_tasks:
                   with ThreadPoolExecutor(max_workers=4) as ex:
-                      for p in ex.map(dl_one, tasks):
-                          if p:
-                              downloaded.append(p)
+                      downloaded = [r for r in ex.map(dl_one, dl_tasks) if r]
 
-              base = build_video(downloaded, w, h, fps, dur, wd)
-              build_music(bg, dur, bgm)
-              build_audio(voice, bgm, dur, audio)
+              VF = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+              ENC = ["-c:v","libx264","-preset","ultrafast","-crf","26","-threads",THREADS,"-an"]
+              seg = max(3, min(6, dur // 8 if dur > 0 else 4))
+              clips = []
+              for i, f in enumerate(downloaded):
+                  kind = detect_kind(f)
+                  out = Path(f"c_{i:03d}.mp4")
+                  if kind == "video":
+                      ok = ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-stream_loop","-1","-i",str(f),"-t",str(seg),"-vf",VF,"-r",str(fps)] + ENC + [str(out)])
+                  elif kind == "image":
+                      ok = ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-loop","1","-i",str(f),"-t",str(seg),"-vf",VF,"-r",str(fps)] + ENC + [str(out)])
+                  else:
+                      ok = False
+                  if ok and out.exists() and out.stat().st_size > 0:
+                      clips.append(out)
 
-              ok = ffmpeg([
-                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                  "-i", str(base), "-i", str(audio),
-                  "-map", "0:v:0", "-map", "1:a:0",
-                  "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-                  str(output),
-              ])
+              base = Path("base.mp4")
+              if clips:
+                  Path("concat.txt").write_text("\n".join(f"file '{c.name}'" for c in clips))
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","concat","-safe","0","-i","concat.txt","-t",str(dur),"-vf",f"fps={fps},format=yuv420p"] + ENC[:-1] + [str(base)])
+              if not (base.exists() and base.stat().st_size > 0):
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}","-t",str(dur)] + ENC + [str(base)])
 
-              if not (ok and output.exists() and output.stat().st_size > 0):
-                  black_video(base, w, h, fps, dur)
-                  ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-i", str(base), "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                      "-map", "0:v:0", "-map", "1:a:0", "-t", str(dur),
-                      "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-                      str(output),
-                  ])
+              bgm = Path("bgm.mp3")
+              if bg == "lofi":
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"anoisesrc=d={dur}:c=pink:r=44100:a=0.02","-af","lowpass=f=3000,bass=g=5","-t",str(dur),"-c:a","libmp3lame","-b:a","128k",str(bgm)])
+              elif bg == "cinematic":
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"sine=f=220:d={dur}","-f","lavfi","-i",f"sine=f=330:d={dur}","-filter_complex","[0:a][1:a]amix=inputs=2:duration=longest,volume=0.05,aecho=0.8:0.88:60:0.4","-t",str(dur),"-c:a","libmp3lame","-b:a","128k",str(bgm)])
+              elif bg not in ("none", ""):
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"anoisesrc=d={dur}:c=white:r=44100:a=0.015","-af","highpass=f=500","-t",str(dur),"-c:a","libmp3lame","-b:a","128k",str(bgm)])
 
-              if not (output.exists() and output.stat().st_size > 0):
-                  ffmpeg([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}",
-                      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                      "-map", "0:v:0", "-map", "1:a:0", "-t", str(dur),
-                      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
-                      "-c:a", "aac", "-shortest", "-movflags", "+faststart",
-                      str(output),
-                  ])
+              audio = Path("audio.m4a")
+              if vo.exists() and bgm.exists():
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(vo),"-i",str(bgm),"-filter_complex","[0:a]volume=1.0[v];[1:a]volume=0.14[b];[v][b]amix=inputs=2:duration=longest[a]","-map","[a]","-t",str(dur),"-c:a","aac","-b:a","192k",str(audio)])
+              elif vo.exists():
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(vo),"-t",str(dur),"-c:a","aac","-b:a","192k",str(audio)])
+              elif bgm.exists():
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(bgm),"-t",str(dur),"-c:a","aac","-b:a","192k",str(audio)])
+              else:
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t",str(dur),"-c:a","aac","-b:a","128k",str(audio)])
 
-              Path("/tmp/output_path.txt").write_text(str(output), encoding="utf-8")
+              out = Path("output.mp4")
+              ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(base),"-i",str(audio),"-map","0:v","-map","1:a","-c:v","copy","-c:a","aac","-shortest","-movflags","+faststart",str(out)])
 
+              if not (out.exists() and out.stat().st_size > 0):
+                  ffmpeg(["ffmpeg","-y","-hide_banner","-loglevel","error","-f","lavfi","-i",f"color=c=black:s={w}x{h}:r={fps}","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t",str(dur),"-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart",str(out)])
+
+              Path("/tmp/output_path.txt").write_text(str(out))
 
           if __name__ == "__main__":
               try:
                   main()
               except Exception:
-                  fallback = Path("/tmp/rw/output.mp4")
-                  fallback.parent.mkdir(parents=True, exist_ok=True)
-                  run([
-                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                      "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=30",
-                      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                      "-map", "0:v:0", "-map", "1:a:0", "-t", "10",
-                      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-                      "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(fallback),
-                  ])
-                  Path("/tmp/output_path.txt").write_text(str(fallback), encoding="utf-8")
-          INNER_EOF
+                  Path("/tmp/rw").mkdir(parents=True, exist_ok=True)
+                  run(["ffmpeg","-y","-f","lavfi","-i","color=c=black:s=1920x1080:r=30","-f","lavfi","-i","anullsrc=r=44100:cl=stereo","-t","10","-c:v","libx264","-preset","ultrafast","-crf","26","-c:a","aac","-shortest","-movflags","+faststart","/tmp/rw/output.mp4"])
+                  Path("/tmp/output_path.txt").write_text("/tmp/rw/output.mp4")
+          PYEOF
           sed -i 's/^          //' /tmp/render.py
 
       - name: Run render
         id: render
-        shell: bash
         run: |
-          set -euo pipefail
           python3 /tmp/render.py
-          OUTPUT="$(cat /tmp/output_path.txt)"
-          test -f "$OUTPUT" || { echo "No output file"; exit 1; }
-          test -s "$OUTPUT" || { echo "Output file is empty"; exit 1; }
+          OUTPUT=$(cat /tmp/output_path.txt)
+          test -f "$OUTPUT" || { echo "No output"; exit 1; }
           ls -lh "$OUTPUT"
           echo "output_path=$OUTPUT" >> "$GITHUB_OUTPUT"
 
-      - name: Upload result
+      - name: Upload
         id: upload
-        shell: bash
         run: |
-          set -euo pipefail
           RID="${{ steps.params.outputs.render_id }}"
           FILE="${{ steps.render.outputs.output_path }}"
           OBJ="github-${RID}.mp4"
-
-          test -f "$FILE" || { echo "Missing file for upload"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
-          test -s "$FILE" || { echo "Empty file for upload"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
-
-          if [[ "$SUPABASE_SERVICE_KEY" == sb_secret_* ]]; then
-            AUTH_HEADER=(
-              -H "apikey: $SUPABASE_SERVICE_KEY"
-              -H "Authorization: Bearer $SUPABASE_ANON_KEY"
-            )
-          else
-            AUTH_HEADER=(
-              -H "apikey: $SUPABASE_ANON_KEY"
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
-            )
-          fi
-
           ATTEMPT=1
-          MAX=3
           OK=false
-          while [ "$ATTEMPT" -le "$MAX" ]; do
-            HTTP=$(curl -sS -w "%{http_code}" -o /tmp/upload_response.txt \
+          while [ "$ATTEMPT" -le 3 ]; do
+            HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
               -X POST "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
-              "${AUTH_HEADER[@]}" \
-              -H "Content-Type: video/mp4" -H "x-upsert: true" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: video/mp4" \
+              -H "x-upsert: true" \
               --data-binary @"$FILE")
-
             if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]; then
               OK=true
               break
             fi
-
-            HTTP=$(curl -sS -w "%{http_code}" -o /tmp/upload_response.txt \
+            HTTP=$(curl -sS -w "%{http_code}" -o /tmp/up.txt \
               -X PUT "$SUPABASE_URL/storage/v1/object/renders/$OBJ" \
-              "${AUTH_HEADER[@]}" \
-              -H "Content-Type: video/mp4" -H "x-upsert: true" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: video/mp4" \
+              -H "x-upsert: true" \
               --data-binary @"$FILE")
-
             if [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]; then
               OK=true
               break
             fi
-
             ATTEMPT=$((ATTEMPT + 1))
             sleep 2
           done
-
           if [ "$OK" = true ]; then
             echo "video_url=$SUPABASE_URL/storage/v1/object/public/renders/$OBJ" >> "$GITHUB_OUTPUT"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            cat /tmp/upload_response.txt || true
+            echo "Upload failed, response:"
+            cat /tmp/up.txt || true
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Callback
         if: always()
-        shell: bash
         run: |
-          set -euo pipefail
           RID="${{ steps.params.outputs.render_id }}"
           CB="${{ steps.params.outputs.callback }}"
           URL="${{ steps.upload.outputs.video_url }}"
           OK="${{ steps.upload.outputs.ok }}"
-
           if [ "$OK" = "true" ] && [ -n "$URL" ]; then
             BODY=$(jq -nc --arg a "$CB" --arg r "$RID" --arg u "$URL" '{action:$a,pending_render_id:$r,video_url:$u}')
           else
-            BODY=$(jq -nc --arg a "$CB" --arg r "$RID" --arg e "render or upload failed" '{action:$a,pending_render_id:$r,error:$e}')
+            BODY=$(jq -nc --arg a "$CB" --arg r "$RID" --arg e "render failed" '{action:$a,pending_render_id:$r,error:$e}')
           fi
-
           curl -sS -X POST "$SUPABASE_URL/functions/v1/kaggle-render" \
-            -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
             -d "$BODY" >/dev/null || true
